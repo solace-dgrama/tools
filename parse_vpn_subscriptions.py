@@ -178,7 +178,7 @@ def parse_text_file(filename):
         # Process data lines (only after we've seen headers)
         if in_data_section and current_vpn is not None:
             # Check if this is a continuation line (starts with 2+ spaces)
-            if line.startswith('  ') and not line.startswith('   '):
+            if line.startswith('  '):
                 # This is a continuation line
                 if current_entry is not None:
                     # Parse continuation line using fixed-width columns
