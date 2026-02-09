@@ -226,11 +226,38 @@ def format_action_list_compact(timestamp: str, actions: List[Dict[str, str]]) ->
     return '\n'.join(output)
 
 
+def deduplicate_executed_actions(executed: List[Tuple[str, Dict[str, str]]]) -> List[Tuple[str, Dict[str, str]]]:
+    """
+    Deduplicate executed actions by global action number.
+
+    The test framework logs each action multiple times to different log facilities.
+    Keep only one entry per global action number, preferring entries with actual timestamps.
+    """
+    seen = {}
+
+    for timestamp, action in executed:
+        global_num = action['global_num']
+
+        if global_num not in seen:
+            seen[global_num] = (timestamp, action)
+        else:
+            # If current entry has a real timestamp and existing doesn't, replace it
+            existing_ts, existing_action = seen[global_num]
+            if timestamp != "Unknown" and existing_ts == "Unknown":
+                seen[global_num] = (timestamp, action)
+
+    # Return in original order (sorted by global action number)
+    return [seen[key] for key in sorted(seen.keys())]
+
+
 def format_executed_actions(executed: List[Tuple[str, Dict[str, str]]]) -> str:
     """Format executed actions grouped by list."""
 
     if not executed:
         return "No executed actions found."
+
+    # Deduplicate entries
+    executed = deduplicate_executed_actions(executed)
 
     output = []
     output.append(f"\n{'='*80}")
