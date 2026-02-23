@@ -8,6 +8,7 @@ Usage:
 Options:
     --executed         Show executed actions from test output instead of declared action lists
     --list N           Show only list N (use with --executed)
+    --traffic          Show traffic validation stats after each CHECK action (use with --executed)
     --help, -h         Show this help message
 
 Arguments:
@@ -22,6 +23,9 @@ Examples:
 
     # Show timeline of executed actions
     ./parse_action_list.py /tmp/processed/log.txt --executed
+
+    # Show timeline with traffic validation stats
+    ./parse_action_list.py /tmp/processed/log.txt --executed --traffic
 
     # Show only executed actions from List 2
     ./parse_action_list.py /tmp/processed/log.txt --executed --list 2
@@ -151,6 +155,129 @@ def extract_executed_actions(log_file: str) -> List[Tuple[str, Dict[str, str]]]:
         return []
 
 
+def extract_traffic_stats(log_file: str) -> Dict[str, Dict[str, any]]:
+    """
+    Extract traffic validation stats from the log file.
+
+    Returns dict keyed by timestamp with traffic stats.
+    """
+    traffic_data = {}
+
+    try:
+        with open(log_file, 'r') as f:
+            lines = f.readlines()
+
+        i = 0
+        while i < len(lines):
+            line = lines[i]
+
+            # Look for traffic validation result
+            if 'Minimum Expected:' in line and 'actual' in line:
+                # Look backward for timestamp (it's on a previous line)
+                timestamp = "Unknown"
+                for j in range(max(0, i - 5), i):
+                    ts_match = re.search(r'\[(\d{2}:\d{2}:\d{2})\]', lines[j])
+                    if ts_match:
+                        timestamp = ts_match.group(1)
+
+                # Extract validation result: "Minimum Expected: 40 (actual 210)"
+                val_match = re.search(r'Minimum Expected:\s+(\d+)\s+\(actual\s+(\d+)\)', line)
+                if val_match:
+                    min_expected = int(val_match.group(1))
+                    actual = int(val_match.group(2))
+
+                    if timestamp not in traffic_data:
+                        traffic_data[timestamp] = {}
+
+                    traffic_data[timestamp]['sub_rx_validation'] = {
+                        'expected': min_expected,
+                        'actual': actual,
+                        'passed': actual >= min_expected
+                    }
+
+            # Look for publisher client-side stats after validation
+            elif 'Publisher client-side stats after ValidateMessageStreamsAtObject:' in line:
+                ts_match = re.search(r'\[(\d{2}:\d{2}:\d{2})\]', line)
+                timestamp = ts_match.group(1) if ts_match else "Unknown"
+
+                # Parse keyed list: {rc OK} {txMsgs 240} {txBytes 7571920} ...
+                stats = {}
+                stats_match = re.findall(r'\{(\w+)\s+([^\}]+)\}', line)
+                for key, value in stats_match:
+                    try:
+                        stats[key] = int(value) if value.isdigit() else value
+                    except ValueError:
+                        stats[key] = value
+
+                if timestamp not in traffic_data:
+                    traffic_data[timestamp] = {}
+
+                traffic_data[timestamp]['pub_stats'] = stats
+
+            # Look for subscriber client-side stats after validation
+            elif 'Subscriber client-side stats after ValidateMessageStreamsAtObject:' in line:
+                ts_match = re.search(r'\[(\d{2}:\d{2}:\d{2})\]', line)
+                timestamp = ts_match.group(1) if ts_match else "Unknown"
+
+                stats = {}
+                stats_match = re.findall(r'\{(\w+)\s+([^\}]+)\}', line)
+                for key, value in stats_match:
+                    try:
+                        stats[key] = int(value) if value.isdigit() else value
+                    except ValueError:
+                        stats[key] = value
+
+                if timestamp not in traffic_data:
+                    traffic_data[timestamp] = {}
+
+                traffic_data[timestamp]['sub_stats'] = stats
+
+            # Look for message-spool stats
+            elif 'Message-spool stats after traffic validation:' in line:
+                ts_match = re.search(r'\[(\d{2}:\d{2}:\d{2})\]', line)
+                timestamp = ts_match.group(1) if ts_match else "Unknown"
+
+                # Look ahead for the XML response with stats
+                j = i + 1
+                spool_stats = {}
+                while j < len(lines) and j < i + 300:
+                    # Extract key message-spool stats from XML
+                    if '<ingress-messages>' in lines[j] and 'ingress' not in spool_stats:
+                        # Match only standalone <ingress-messages>, not compound tags
+                        match = re.search(r'<ingress-messages>(\d+)</ingress-messages>', lines[j])
+                        if match:
+                            spool_stats['ingress'] = int(match.group(1))
+                    elif '<egress-messages>' in lines[j] and 'egress' not in spool_stats:
+                        # Match only standalone <egress-messages>
+                        match = re.search(r'<egress-messages>(\d+)</egress-messages>', lines[j])
+                        if match:
+                            spool_stats['egress'] = int(match.group(1))
+                    elif '<total-discarded-messages>' in lines[j]:
+                        match = re.search(r'<total-discarded-messages>(\d+)</total-discarded-messages>', lines[j])
+                        if match:
+                            spool_stats['discards'] = int(match.group(1))
+
+                    # Stop when we have all three values
+                    if 'ingress' in spool_stats and 'egress' in spool_stats and 'discards' in spool_stats:
+                        break
+
+                    j += 1
+
+                if spool_stats and timestamp not in traffic_data:
+                    traffic_data[timestamp] = {}
+
+                if spool_stats:
+                    traffic_data[timestamp]['msg_spool'] = spool_stats
+
+            i += 1
+
+        return traffic_data
+
+    except FileNotFoundError:
+        print(f"Error: Log file '{log_file}' not found", file=sys.stderr)
+        return {}
+
+
 def parse_actions(action_text: str) -> List[Dict[str, str]]:
     """
     Parse the action list text into structured actions.
@@ -250,7 +377,8 @@ def deduplicate_executed_actions(executed: List[Tuple[str, Dict[str, str]]]) -> 
     return [seen[key] for key in sorted(seen.keys())]
 
 
-def format_executed_actions(executed: List[Tuple[str, Dict[str, str]]]) -> str:
+def format_executed_actions(executed: List[Tuple[str, Dict[str, str]]],
+                            traffic_data: Dict[str, Dict[str, any]] = None) -> str:
     """Format executed actions grouped by list."""
 
     if not executed:
@@ -296,13 +424,99 @@ def format_executed_actions(executed: List[Tuple[str, Dict[str, str]]]) -> str:
 
         output.append(f"  [{timestamp}] #{global_num:3d} (Act {action_num:2d}): {desc}")
 
+        # Add traffic stats after CHECK actions if available
+        if action_name == 'check' and traffic_data:
+            # Look for traffic stats within a few seconds of this timestamp
+            traffic_stats = find_traffic_stats_near_timestamp(timestamp, traffic_data)
+            if traffic_stats:
+                output.append("")
+                output.append(format_traffic_stats(traffic_stats))
+
     return '\n'.join(output)
+
+
+def find_traffic_stats_near_timestamp(check_timestamp: str,
+                                       traffic_data: Dict[str, Dict[str, any]],
+                                       window_seconds: int = 30) -> Dict[str, any]:
+    """
+    Find traffic stats near the given timestamp (within window_seconds).
+
+    Returns the traffic stats dict or None if not found.
+    """
+    if not traffic_data:
+        return None
+
+    # Parse check timestamp to seconds
+    try:
+        h, m, s = map(int, check_timestamp.split(':'))
+        check_secs = h * 3600 + m * 60 + s
+    except (ValueError, AttributeError):
+        return None
+
+    # Find closest traffic stats within window
+    closest_stats = None
+    min_diff = window_seconds + 1
+
+    for ts, stats in traffic_data.items():
+        try:
+            h, m, s = map(int, ts.split(':'))
+            traffic_secs = h * 3600 + m * 60 + s
+
+            diff = abs(traffic_secs - check_secs)
+            if diff < min_diff and diff <= window_seconds:
+                min_diff = diff
+                closest_stats = stats.copy()
+                closest_stats['timestamp'] = ts
+        except (ValueError, AttributeError):
+            continue
+
+    return closest_stats
+
+
+def format_traffic_stats(stats: Dict[str, any]) -> str:
+    """Format traffic stats for display."""
+    lines = []
+    ts = stats.get('timestamp', 'Unknown')
+    lines.append(f"    Traffic Validation ({ts}):")
+
+    # Subscriber RX validation
+    if 'sub_rx_validation' in stats:
+        val = stats['sub_rx_validation']
+        status = '✓' if val['passed'] else '✗'
+        lines.append(f"      Subscriber RX: {val['actual']} msgs "
+                     f"(expected ≥{val['expected']}) {status}")
+
+    # Publisher client-side stats
+    if 'pub_stats' in stats:
+        pub = stats['pub_stats']
+        tx_msgs = pub.get('txMsgs', 0)
+        tx_rate = pub.get('txMsgRate', 0.0)
+        lines.append(f"      Pub Client:  txMsgs={tx_msgs}, txRate={tx_rate} msg/s")
+
+    # Subscriber client-side stats
+    if 'sub_stats' in stats:
+        sub = stats['sub_stats']
+        rx_msgs = sub.get('rxMsgs', 0)
+        rx_rate = sub.get('rxMsgRate', 0.0)
+        lines.append(f"      Sub Client:  rxMsgs={rx_msgs}, rxRate={rx_rate} msg/s")
+
+    # Message-spool stats
+    if 'msg_spool' in stats:
+        spool = stats['msg_spool']
+        ingress = spool.get('ingress', 0)
+        egress = spool.get('egress', 0)
+        discards = spool.get('discards', 0)
+        lines.append(f"      Msg Spool:   ingress={ingress}, egress={egress}, "
+                     f"discards={discards}")
+
+    return '\n'.join(lines)
 
 
 def main():
     # Parse command line arguments
     log_file = '/tmp/debug/log.txt'
     show_executed = False
+    show_traffic = False
     filter_list = None
 
     i = 1
@@ -312,6 +526,8 @@ def main():
             print_help()
         elif arg == '--executed':
             show_executed = True
+        elif arg == '--traffic':
+            show_traffic = True
         elif arg == '--list' and i + 1 < len(sys.argv):
             filter_list = int(sys.argv[i + 1])
             i += 1
@@ -323,6 +539,8 @@ def main():
     mode_str = 'Executed actions' if show_executed else 'Declared action lists'
     if filter_list is not None:
         mode_str += f" (List {filter_list} only)"
+    if show_traffic:
+        mode_str += " with traffic stats"
     print(f"Mode: {mode_str}\n")
 
     if show_executed:
@@ -338,7 +556,16 @@ def main():
             executed = [(ts, act) for ts, act in executed if act['list_num'] == filter_list]
 
         print(f"Found {len(executed)} executed action(s)\n")
-        print(format_executed_actions(executed))
+
+        # Extract traffic stats if requested
+        traffic_data = None
+        if show_traffic:
+            print("Extracting traffic validation stats...\n")
+            traffic_data = extract_traffic_stats(log_file)
+            if traffic_data:
+                print(f"Found {len(traffic_data)} traffic validation entries\n")
+
+        print(format_executed_actions(executed, traffic_data))
 
     else:
         # Extract and display declared action lists
