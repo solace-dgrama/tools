@@ -567,6 +567,7 @@ def format_executed_actions(executed: List[Tuple[str, Dict[str, str]]],
     output.append(f"{'='*80}\n")
 
     current_list = None
+    previous_traffic_stats = None  # Track previous CHECK stats for per-client deltas
 
     for timestamp, action in executed:
         list_num = action['list_num']
@@ -604,7 +605,8 @@ def format_executed_actions(executed: List[Tuple[str, Dict[str, str]]],
             traffic_stats = find_traffic_stats_near_timestamp(timestamp, traffic_data)
             if traffic_stats:
                 output.append("")
-                output.append(format_traffic_stats(traffic_stats))
+                output.append(format_traffic_stats(traffic_stats, previous_traffic_stats))
+                previous_traffic_stats = traffic_stats
 
     return '\n'.join(output)
 
@@ -647,7 +649,8 @@ def find_traffic_stats_near_timestamp(check_timestamp: str,
     return closest_stats
 
 
-def format_traffic_stats(stats: Dict[str, any]) -> str:
+def format_traffic_stats(stats: Dict[str, any],
+                         previous_stats: Dict[str, any] = None) -> str:
     """Format traffic stats for display."""
     lines = []
     ts = stats.get('timestamp', 'Unknown')
@@ -671,12 +674,18 @@ def format_traffic_stats(stats: Dict[str, any]) -> str:
         lines.append(f"      Pub Client:  txMsgs={tx_msgs_after} (delta {delta}), "
                      f"txRate={tx_rate} msg/s")
 
-    # Publisher broker-side stats (per-client)
+    # Publisher broker-side stats (per-client with deltas)
     if 'pub_broker_stats' in stats and isinstance(stats['pub_broker_stats'], list):
         pub_clients = stats['pub_broker_stats']
         if len(pub_clients) > 0:
             lines.append(f"      Publishers:  {len(pub_clients)} client(s)")
             total_inflight = 0
+
+            # Build lookup for previous stats
+            prev_pub_by_name = {}
+            if previous_stats and 'pub_broker_stats' in previous_stats:
+                for prev_pub in previous_stats['pub_broker_stats']:
+                    prev_pub_by_name[prev_pub.get('name', '')] = prev_pub
 
             for pub in pub_clients:
                 name = pub.get('name', 'unknown')
@@ -686,7 +695,14 @@ def format_traffic_stats(stats: Dict[str, any]) -> str:
                 inflight = pub.get('inflight', 0)
                 total_inflight += inflight
 
-                lines.append(f"        {short_name}: lastMsgId={last_msg_id}, "
+                # Calculate delta from previous CHECK
+                delta_str = ""
+                if name in prev_pub_by_name:
+                    prev_last_msg_id = prev_pub_by_name[name].get('last_msg_id', 0)
+                    delta = last_msg_id - prev_last_msg_id
+                    delta_str = f" (delta {delta})"
+
+                lines.append(f"        {short_name}: lastMsgId={last_msg_id}{delta_str}, "
                              f"window={window_size}, inflight={inflight}")
 
             # Show total from client-side aggregate (which is the traffic test delta)
@@ -706,12 +722,18 @@ def format_traffic_stats(stats: Dict[str, any]) -> str:
         rx_rate = sub_after.get('rxMsgRate', 0.0)
         lines.append(f"      Sub Client:  rxMsgs={rx_msgs}, rxRate={rx_rate} msg/s")
 
-    # Subscriber broker-side stats (per-client)
+    # Subscriber broker-side stats (per-client with deltas)
     if 'sub_broker_stats' in stats and isinstance(stats['sub_broker_stats'], list):
         sub_clients = stats['sub_broker_stats']
         if len(sub_clients) > 0:
             lines.append(f"      Subscribers: {len(sub_clients)} client(s)")
             total_window_closed = 0
+
+            # Build lookup for previous stats
+            prev_sub_by_name = {}
+            if previous_stats and 'sub_broker_stats' in previous_stats:
+                for prev_sub in previous_stats['sub_broker_stats']:
+                    prev_sub_by_name[prev_sub.get('name', '')] = prev_sub
 
             for sub in sub_clients:
                 name = sub.get('name', 'unknown')
@@ -724,10 +746,27 @@ def format_traffic_stats(stats: Dict[str, any]) -> str:
                 window_closed = sub.get('window_closed', 0)
                 total_window_closed += window_closed
 
+                # Calculate deltas from previous CHECK (only if same flow)
+                confirmed_delta_str = ""
+                window_closed_delta_str = ""
+                if name in prev_sub_by_name:
+                    prev_flow_id = prev_sub_by_name[name].get('flow_id', -1)
+                    # Only calculate delta if it's the same flow (subscriber didn't reconnect)
+                    if prev_flow_id == flow_id:
+                        prev_confirmed = prev_sub_by_name[name].get('confirmed_delivered', 0)
+                        prev_window_closed = prev_sub_by_name[name].get('window_closed', 0)
+                        confirmed_delta = confirmed - prev_confirmed
+                        window_closed_delta = window_closed - prev_window_closed
+                        confirmed_delta_str = f" (delta {confirmed_delta})"
+                        window_closed_delta_str = f" (delta {window_closed_delta})"
+                    else:
+                        confirmed_delta_str = " (new flow)"
+                        window_closed_delta_str = ""
+
                 lines.append(f"        {short_name}: flowId={flow_id}, usedWindow={used_window}, "
                              f"ackPending={low_msg_id}-{high_msg_id}")
-                lines.append(f"                  confirmed={confirmed}, "
-                             f"windowClosed={window_closed}")
+                lines.append(f"                  confirmed={confirmed}{confirmed_delta_str}, "
+                             f"windowClosed={window_closed}{window_closed_delta_str}")
 
             # Show total from client-side aggregate (which is the traffic test delta)
             if 'sub_stats_after' in stats:
