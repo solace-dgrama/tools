@@ -195,7 +195,25 @@ def extract_traffic_stats(log_file: str) -> Dict[str, Dict[str, any]]:
                         'passed': actual >= min_expected
                     }
 
-            # Look for publisher client-side stats after validation
+            # Look for publisher client-side stats BEFORE validation (for delta)
+            elif 'Publisher client-side stats before ValidateMessageStreamsAtObject:' in line:
+                ts_match = re.search(r'\[(\d{2}:\d{2}:\d{2})\]', line)
+                timestamp = ts_match.group(1) if ts_match else "Unknown"
+
+                stats = {}
+                stats_match = re.findall(r'\{(\w+)\s+([^\}]+)\}', line)
+                for key, value in stats_match:
+                    try:
+                        stats[key] = int(value) if value.isdigit() else value
+                    except ValueError:
+                        stats[key] = value
+
+                if timestamp not in traffic_data:
+                    traffic_data[timestamp] = {}
+
+                traffic_data[timestamp]['pub_stats_before'] = stats
+
+            # Look for publisher client-side stats AFTER validation
             elif 'Publisher client-side stats after ValidateMessageStreamsAtObject:' in line:
                 ts_match = re.search(r'\[(\d{2}:\d{2}:\d{2})\]', line)
                 timestamp = ts_match.group(1) if ts_match else "Unknown"
@@ -212,9 +230,9 @@ def extract_traffic_stats(log_file: str) -> Dict[str, Dict[str, any]]:
                 if timestamp not in traffic_data:
                     traffic_data[timestamp] = {}
 
-                traffic_data[timestamp]['pub_stats'] = stats
+                traffic_data[timestamp]['pub_stats_after'] = stats
 
-            # Look for subscriber client-side stats after validation
+            # Look for subscriber client-side stats AFTER validation
             elif 'Subscriber client-side stats after ValidateMessageStreamsAtObject:' in line:
                 ts_match = re.search(r'\[(\d{2}:\d{2}:\d{2})\]', line)
                 timestamp = ts_match.group(1) if ts_match else "Unknown"
@@ -230,87 +248,135 @@ def extract_traffic_stats(log_file: str) -> Dict[str, Dict[str, any]]:
                 if timestamp not in traffic_data:
                     traffic_data[timestamp] = {}
 
-                traffic_data[timestamp]['sub_stats'] = stats
+                traffic_data[timestamp]['sub_stats_after'] = stats
 
             # Look for publisher broker-side stats
             elif 'Publisher client message-spool-stats after traffic validation:' in line:
                 ts_match = re.search(r'\[(\d{2}:\d{2}:\d{2})\]', line)
                 timestamp = ts_match.group(1) if ts_match else "Unknown"
 
-                # Look ahead for XML response with publisher ingress flow stats
-                j = i + 1
-                pub_broker_stats = {}
-                while j < len(lines) and j < i + 300:
-                    if '<last-message-id-sent>' in lines[j]:
-                        match = re.search(r'<last-message-id-sent>(\d+)</last-message-id-sent>', lines[j])
-                        if match:
-                            pub_broker_stats['last_msg_id'] = int(match.group(1))
-                    elif '<window-size>' in lines[j] and 'window_size' not in pub_broker_stats:
-                        match = re.search(r'<window-size>(\d+)</window-size>', lines[j])
-                        if match:
-                            pub_broker_stats['window_size'] = int(match.group(1))
-                    elif '<guaranteed-messages>' in lines[j]:
-                        match = re.search(r'<guaranteed-messages>(\d+)</guaranteed-messages>', lines[j])
-                        if match:
-                            pub_broker_stats['inflight'] = int(match.group(1))
+                if timestamp not in traffic_data:
+                    traffic_data[timestamp] = {}
 
-                    if 'last_msg_id' in pub_broker_stats and 'window_size' in pub_broker_stats and 'inflight' in pub_broker_stats:
+                # Parse multiple publisher clients
+                traffic_data[timestamp]['pub_broker_stats'] = []
+                j = i + 1
+                current_client_name = None
+                current_stats = {}
+
+                # Look ahead for multiple publisher clients
+                while j < len(lines) and j < i + 5000:
+                    # Stop when we hit subscriber stats
+                    if 'Subscriber client message-spool-stats after traffic validation:' in lines[j]:
                         break
+
+                    # Look for client name in the SEMP command
+                    if 'P2: -name c_vmrRedundancyRandomActions_pub_' in lines[j]:
+                        # Save previous client if any
+                        if current_client_name and current_stats:
+                            traffic_data[timestamp]['pub_broker_stats'].append({
+                                'name': current_client_name,
+                                **current_stats
+                            })
+                        # Start new client
+                        name_match = re.search(r'P2: -name (c_vmrRedundancyRandomActions_pub_\d+)', lines[j])
+                        if name_match:
+                            current_client_name = name_match.group(1)
+                            current_stats = {}
+
+                    # Extract stats for current client
+                    elif current_client_name:
+                        if '<last-message-id-sent>' in lines[j]:
+                            match = re.search(r'<last-message-id-sent>(\d+)</last-message-id-sent>', lines[j])
+                            if match:
+                                current_stats['last_msg_id'] = int(match.group(1))
+                        elif '<window-size>' in lines[j] and 'window_size' not in current_stats:
+                            match = re.search(r'<window-size>(\d+)</window-size>', lines[j])
+                            if match:
+                                current_stats['window_size'] = int(match.group(1))
+                        elif '<guaranteed-messages>' in lines[j]:
+                            match = re.search(r'<guaranteed-messages>(\d+)</guaranteed-messages>', lines[j])
+                            if match:
+                                current_stats['inflight'] = int(match.group(1))
 
                     j += 1
 
-                if pub_broker_stats and timestamp not in traffic_data:
-                    traffic_data[timestamp] = {}
-
-                if pub_broker_stats:
-                    traffic_data[timestamp]['pub_broker_stats'] = pub_broker_stats
+                # Save last client
+                if current_client_name and current_stats:
+                    traffic_data[timestamp]['pub_broker_stats'].append({
+                        'name': current_client_name,
+                        **current_stats
+                    })
 
             # Look for subscriber broker-side stats
             elif 'Subscriber client message-spool-stats after traffic validation:' in line:
                 ts_match = re.search(r'\[(\d{2}:\d{2}:\d{2})\]', line)
                 timestamp = ts_match.group(1) if ts_match else "Unknown"
 
-                # Look ahead for XML response with egress flow stats
-                j = i + 1
-                sub_broker_stats = {}
-                while j < len(lines) and j < i + 300:
-                    if '<flow-id>' in lines[j] and 'flow_id' not in sub_broker_stats:
-                        match = re.search(r'<flow-id>(\d+)</flow-id>', lines[j])
-                        if match:
-                            sub_broker_stats['flow_id'] = int(match.group(1))
-                    elif '<used-window>' in lines[j]:
-                        match = re.search(r'<used-window>(\d+)</used-window>', lines[j])
-                        if match:
-                            sub_broker_stats['used_window'] = int(match.group(1))
-                    elif '<low-message-id-ack-pending>' in lines[j]:
-                        match = re.search(r'<low-message-id-ack-pending>(\d+)</low-message-id-ack-pending>', lines[j])
-                        if match:
-                            sub_broker_stats['low_msg_id_pending'] = int(match.group(1))
-                    elif '<high-message-id-ack-pending>' in lines[j]:
-                        match = re.search(r'<high-message-id-ack-pending>(\d+)</high-message-id-ack-pending>', lines[j])
-                        if match:
-                            sub_broker_stats['high_msg_id_pending'] = int(match.group(1))
-                    elif '<message-confirmed-delivered>' in lines[j]:
-                        match = re.search(r'<message-confirmed-delivered>(\d+)</message-confirmed-delivered>', lines[j])
-                        if match:
-                            sub_broker_stats['confirmed_delivered'] = int(match.group(1))
-                    elif '<window-closed>' in lines[j]:
-                        match = re.search(r'<window-closed>(\d+)</window-closed>', lines[j])
-                        if match:
-                            sub_broker_stats['window_closed'] = int(match.group(1))
+                if timestamp not in traffic_data:
+                    traffic_data[timestamp] = {}
 
-                    # Stop after we found the key stats
-                    if ('flow_id' in sub_broker_stats and 'used_window' in sub_broker_stats and
-                        'confirmed_delivered' in sub_broker_stats):
+                # Parse multiple subscriber clients
+                traffic_data[timestamp]['sub_broker_stats'] = []
+                j = i + 1
+                current_client_name = None
+                current_stats = {}
+
+                # Look ahead for multiple subscriber clients
+                while j < len(lines) and j < i + 5000:
+                    # Stop when we hit a different section
+                    if 'Message-spool stats after traffic validation:' in lines[j]:
                         break
+
+                    # Look for client name in the SEMP command
+                    if 'P2: -name c_vmrRedundancyRandomActions_sub_' in lines[j]:
+                        # Save previous client if any
+                        if current_client_name and current_stats:
+                            traffic_data[timestamp]['sub_broker_stats'].append({
+                                'name': current_client_name,
+                                **current_stats
+                            })
+                        # Start new client
+                        name_match = re.search(r'P2: -name (c_vmrRedundancyRandomActions_sub_\d+)', lines[j])
+                        if name_match:
+                            current_client_name = name_match.group(1)
+                            current_stats = {}
+
+                    # Extract stats for current client
+                    elif current_client_name:
+                        if '<flow-id>' in lines[j] and 'flow_id' not in current_stats:
+                            match = re.search(r'<flow-id>(\d+)</flow-id>', lines[j])
+                            if match:
+                                current_stats['flow_id'] = int(match.group(1))
+                        elif '<used-window>' in lines[j]:
+                            match = re.search(r'<used-window>(\d+)</used-window>', lines[j])
+                            if match:
+                                current_stats['used_window'] = int(match.group(1))
+                        elif '<low-message-id-ack-pending>' in lines[j]:
+                            match = re.search(r'<low-message-id-ack-pending>(\d+)</low-message-id-ack-pending>', lines[j])
+                            if match:
+                                current_stats['low_msg_id_pending'] = int(match.group(1))
+                        elif '<high-message-id-ack-pending>' in lines[j]:
+                            match = re.search(r'<high-message-id-ack-pending>(\d+)</high-message-id-ack-pending>', lines[j])
+                            if match:
+                                current_stats['high_msg_id_pending'] = int(match.group(1))
+                        elif '<message-confirmed-delivered>' in lines[j]:
+                            match = re.search(r'<message-confirmed-delivered>(\d+)</message-confirmed-delivered>', lines[j])
+                            if match:
+                                current_stats['confirmed_delivered'] = int(match.group(1))
+                        elif '<window-closed>' in lines[j]:
+                            match = re.search(r'<window-closed>(\d+)</window-closed>', lines[j])
+                            if match:
+                                current_stats['window_closed'] = int(match.group(1))
 
                     j += 1
 
-                if sub_broker_stats and timestamp not in traffic_data:
-                    traffic_data[timestamp] = {}
-
-                if sub_broker_stats:
-                    traffic_data[timestamp]['sub_broker_stats'] = sub_broker_stats
+                # Save last client
+                if current_client_name and current_stats:
+                    traffic_data[timestamp]['sub_broker_stats'].append({
+                        'name': current_client_name,
+                        **current_stats
+                    })
 
             # Look for message-spool stats
             elif 'Message-spool stats after traffic validation:' in line:
@@ -351,7 +417,35 @@ def extract_traffic_stats(log_file: str) -> Dict[str, Dict[str, any]]:
 
             i += 1
 
-        return traffic_data
+        # Post-process: merge "before" and "after" stats that are close together
+        merged_data = {}
+        timestamps = sorted(traffic_data.keys(), key=lambda t: tuple(map(int, t.split(':'))))
+
+        for ts in timestamps:
+            data = traffic_data[ts]
+
+            # If this entry has "after" stats, it's a complete entry
+            if 'pub_stats_after' in data or 'sub_stats_after' in data:
+                # Look for a nearby "before" entry to merge
+                ts_secs = sum(int(x) * (60 ** (2 - i)) for i, x in enumerate(ts.split(':')))
+                for prev_ts in timestamps:
+                    prev_secs = sum(int(x) * (60 ** (2 - i)) for i, x in enumerate(prev_ts.split(':')))
+                    if abs(prev_secs - ts_secs) <= 5 and 'pub_stats_before' in traffic_data[prev_ts]:
+                        # Merge the "before" stats into this entry
+                        data['pub_stats_before'] = traffic_data[prev_ts]['pub_stats_before']
+                        break
+
+                merged_data[ts] = data
+
+            # If this entry only has "before" stats, skip it (it will be merged elsewhere)
+            elif 'pub_stats_before' in data:
+                continue
+
+            # Otherwise, keep it as is
+            else:
+                merged_data[ts] = data
+
+        return merged_data
 
     except FileNotFoundError:
         print(f"Error: Log file '{log_file}' not found", file=sys.stderr)
@@ -566,41 +660,64 @@ def format_traffic_stats(stats: Dict[str, any]) -> str:
         lines.append(f"      Subscriber RX: {val['actual']} msgs "
                      f"(expected ≥{val['expected']}) {status}")
 
-    # Publisher client-side stats
-    if 'pub_stats' in stats:
-        pub = stats['pub_stats']
-        tx_msgs = pub.get('txMsgs', 0)
-        tx_rate = pub.get('txMsgRate', 0.0)
-        lines.append(f"      Pub Client:  txMsgs={tx_msgs}, txRate={tx_rate} msg/s")
+    # Publisher client-side stats (aggregate with delta)
+    if 'pub_stats_after' in stats:
+        pub_after = stats['pub_stats_after']
+        pub_before = stats.get('pub_stats_before', {})
+        tx_msgs_after = pub_after.get('txMsgs', 0)
+        tx_msgs_before = pub_before.get('txMsgs', 0)
+        delta = tx_msgs_after - tx_msgs_before
+        tx_rate = pub_after.get('txMsgRate', 0.0)
+        lines.append(f"      Pub Client:  txMsgs={tx_msgs_after} (Δ{delta}), "
+                     f"txRate={tx_rate} msg/s")
 
-    # Publisher broker-side stats
-    if 'pub_broker_stats' in stats:
-        pub_broker = stats['pub_broker_stats']
-        last_msg_id = pub_broker.get('last_msg_id', 0)
-        window_size = pub_broker.get('window_size', 0)
-        inflight = pub_broker.get('inflight', 0)
-        lines.append(f"      Pub Broker:  lastMsgId={last_msg_id}, window={window_size}, "
-                     f"inflight={inflight}")
+    # Publisher broker-side stats (per-client and aggregate)
+    if 'pub_broker_stats' in stats and isinstance(stats['pub_broker_stats'], list):
+        pub_clients = stats['pub_broker_stats']
+        if len(pub_clients) > 0:
+            lines.append(f"      Publishers:  {len(pub_clients)} client(s)")
+            total_inflight = 0
+            for pub in pub_clients:
+                name = pub.get('name', 'unknown')
+                short_name = name.replace('c_vmrRedundancyRandomActions_pub_', 'pub_')
+                last_msg_id = pub.get('last_msg_id', 0)
+                window_size = pub.get('window_size', 0)
+                inflight = pub.get('inflight', 0)
+                total_inflight += inflight
+                lines.append(f"        {short_name}: lastMsgId={last_msg_id}, "
+                             f"window={window_size}, inflight={inflight}")
+            lines.append(f"        TOTAL: inflight={total_inflight}")
 
-    # Subscriber client-side stats
-    if 'sub_stats' in stats:
-        sub = stats['sub_stats']
-        rx_msgs = sub.get('rxMsgs', 0)
-        rx_rate = sub.get('rxMsgRate', 0.0)
+    # Subscriber client-side stats (aggregate with delta)
+    if 'sub_stats_after' in stats:
+        sub_after = stats['sub_stats_after']
+        rx_msgs = sub_after.get('rxMsgs', 0)
+        rx_rate = sub_after.get('rxMsgRate', 0.0)
         lines.append(f"      Sub Client:  rxMsgs={rx_msgs}, rxRate={rx_rate} msg/s")
 
-    # Subscriber broker-side stats
-    if 'sub_broker_stats' in stats:
-        sub_broker = stats['sub_broker_stats']
-        flow_id = sub_broker.get('flow_id', 0)
-        used_window = sub_broker.get('used_window', 0)
-        low_msg_id = sub_broker.get('low_msg_id_pending', 0)
-        high_msg_id = sub_broker.get('high_msg_id_pending', 0)
-        confirmed = sub_broker.get('confirmed_delivered', 0)
-        window_closed = sub_broker.get('window_closed', 0)
-        lines.append(f"      Sub Broker:  flowId={flow_id}, usedWindow={used_window}, "
-                     f"ackPending={low_msg_id}-{high_msg_id}")
-        lines.append(f"                   confirmed={confirmed}, windowClosed={window_closed}")
+    # Subscriber broker-side stats (per-client and aggregate)
+    if 'sub_broker_stats' in stats and isinstance(stats['sub_broker_stats'], list):
+        sub_clients = stats['sub_broker_stats']
+        if len(sub_clients) > 0:
+            lines.append(f"      Subscribers: {len(sub_clients)} client(s)")
+            total_confirmed = 0
+            total_window_closed = 0
+            for sub in sub_clients:
+                name = sub.get('name', 'unknown')
+                short_name = name.replace('c_vmrRedundancyRandomActions_sub_', 'sub_')
+                flow_id = sub.get('flow_id', 0)
+                used_window = sub.get('used_window', 0)
+                low_msg_id = sub.get('low_msg_id_pending', 0)
+                high_msg_id = sub.get('high_msg_id_pending', 0)
+                confirmed = sub.get('confirmed_delivered', 0)
+                window_closed = sub.get('window_closed', 0)
+                total_confirmed += confirmed
+                total_window_closed += window_closed
+                lines.append(f"        {short_name}: flowId={flow_id}, usedWindow={used_window}, "
+                             f"ackPending={low_msg_id}-{high_msg_id}")
+                lines.append(f"                  confirmed={confirmed}, windowClosed={window_closed}")
+            lines.append(f"        TOTAL: confirmed={total_confirmed}, "
+                         f"windowClosed={total_window_closed}")
 
     # Message-spool stats
     if 'msg_spool' in stats:
