@@ -232,6 +232,86 @@ def extract_traffic_stats(log_file: str) -> Dict[str, Dict[str, any]]:
 
                 traffic_data[timestamp]['sub_stats'] = stats
 
+            # Look for publisher broker-side stats
+            elif 'Publisher client message-spool-stats after traffic validation:' in line:
+                ts_match = re.search(r'\[(\d{2}:\d{2}:\d{2})\]', line)
+                timestamp = ts_match.group(1) if ts_match else "Unknown"
+
+                # Look ahead for XML response with publisher ingress flow stats
+                j = i + 1
+                pub_broker_stats = {}
+                while j < len(lines) and j < i + 300:
+                    if '<last-message-id-sent>' in lines[j]:
+                        match = re.search(r'<last-message-id-sent>(\d+)</last-message-id-sent>', lines[j])
+                        if match:
+                            pub_broker_stats['last_msg_id'] = int(match.group(1))
+                    elif '<window-size>' in lines[j] and 'window_size' not in pub_broker_stats:
+                        match = re.search(r'<window-size>(\d+)</window-size>', lines[j])
+                        if match:
+                            pub_broker_stats['window_size'] = int(match.group(1))
+                    elif '<guaranteed-messages>' in lines[j]:
+                        match = re.search(r'<guaranteed-messages>(\d+)</guaranteed-messages>', lines[j])
+                        if match:
+                            pub_broker_stats['inflight'] = int(match.group(1))
+
+                    if 'last_msg_id' in pub_broker_stats and 'window_size' in pub_broker_stats and 'inflight' in pub_broker_stats:
+                        break
+
+                    j += 1
+
+                if pub_broker_stats and timestamp not in traffic_data:
+                    traffic_data[timestamp] = {}
+
+                if pub_broker_stats:
+                    traffic_data[timestamp]['pub_broker_stats'] = pub_broker_stats
+
+            # Look for subscriber broker-side stats
+            elif 'Subscriber client message-spool-stats after traffic validation:' in line:
+                ts_match = re.search(r'\[(\d{2}:\d{2}:\d{2})\]', line)
+                timestamp = ts_match.group(1) if ts_match else "Unknown"
+
+                # Look ahead for XML response with egress flow stats
+                j = i + 1
+                sub_broker_stats = {}
+                while j < len(lines) and j < i + 300:
+                    if '<flow-id>' in lines[j] and 'flow_id' not in sub_broker_stats:
+                        match = re.search(r'<flow-id>(\d+)</flow-id>', lines[j])
+                        if match:
+                            sub_broker_stats['flow_id'] = int(match.group(1))
+                    elif '<used-window>' in lines[j]:
+                        match = re.search(r'<used-window>(\d+)</used-window>', lines[j])
+                        if match:
+                            sub_broker_stats['used_window'] = int(match.group(1))
+                    elif '<low-message-id-ack-pending>' in lines[j]:
+                        match = re.search(r'<low-message-id-ack-pending>(\d+)</low-message-id-ack-pending>', lines[j])
+                        if match:
+                            sub_broker_stats['low_msg_id_pending'] = int(match.group(1))
+                    elif '<high-message-id-ack-pending>' in lines[j]:
+                        match = re.search(r'<high-message-id-ack-pending>(\d+)</high-message-id-ack-pending>', lines[j])
+                        if match:
+                            sub_broker_stats['high_msg_id_pending'] = int(match.group(1))
+                    elif '<message-confirmed-delivered>' in lines[j]:
+                        match = re.search(r'<message-confirmed-delivered>(\d+)</message-confirmed-delivered>', lines[j])
+                        if match:
+                            sub_broker_stats['confirmed_delivered'] = int(match.group(1))
+                    elif '<window-closed>' in lines[j]:
+                        match = re.search(r'<window-closed>(\d+)</window-closed>', lines[j])
+                        if match:
+                            sub_broker_stats['window_closed'] = int(match.group(1))
+
+                    # Stop after we found the key stats
+                    if ('flow_id' in sub_broker_stats and 'used_window' in sub_broker_stats and
+                        'confirmed_delivered' in sub_broker_stats):
+                        break
+
+                    j += 1
+
+                if sub_broker_stats and timestamp not in traffic_data:
+                    traffic_data[timestamp] = {}
+
+                if sub_broker_stats:
+                    traffic_data[timestamp]['sub_broker_stats'] = sub_broker_stats
+
             # Look for message-spool stats
             elif 'Message-spool stats after traffic validation:' in line:
                 ts_match = re.search(r'\[(\d{2}:\d{2}:\d{2})\]', line)
@@ -493,12 +573,34 @@ def format_traffic_stats(stats: Dict[str, any]) -> str:
         tx_rate = pub.get('txMsgRate', 0.0)
         lines.append(f"      Pub Client:  txMsgs={tx_msgs}, txRate={tx_rate} msg/s")
 
+    # Publisher broker-side stats
+    if 'pub_broker_stats' in stats:
+        pub_broker = stats['pub_broker_stats']
+        last_msg_id = pub_broker.get('last_msg_id', 0)
+        window_size = pub_broker.get('window_size', 0)
+        inflight = pub_broker.get('inflight', 0)
+        lines.append(f"      Pub Broker:  lastMsgId={last_msg_id}, window={window_size}, "
+                     f"inflight={inflight}")
+
     # Subscriber client-side stats
     if 'sub_stats' in stats:
         sub = stats['sub_stats']
         rx_msgs = sub.get('rxMsgs', 0)
         rx_rate = sub.get('rxMsgRate', 0.0)
         lines.append(f"      Sub Client:  rxMsgs={rx_msgs}, rxRate={rx_rate} msg/s")
+
+    # Subscriber broker-side stats
+    if 'sub_broker_stats' in stats:
+        sub_broker = stats['sub_broker_stats']
+        flow_id = sub_broker.get('flow_id', 0)
+        used_window = sub_broker.get('used_window', 0)
+        low_msg_id = sub_broker.get('low_msg_id_pending', 0)
+        high_msg_id = sub_broker.get('high_msg_id_pending', 0)
+        confirmed = sub_broker.get('confirmed_delivered', 0)
+        window_closed = sub_broker.get('window_closed', 0)
+        lines.append(f"      Sub Broker:  flowId={flow_id}, usedWindow={used_window}, "
+                     f"ackPending={low_msg_id}-{high_msg_id}")
+        lines.append(f"                   confirmed={confirmed}, windowClosed={window_closed}")
 
     # Message-spool stats
     if 'msg_spool' in stats:
