@@ -31,7 +31,7 @@ import argparse
 import random
 import sys
 from collections import defaultdict
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Set
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -60,6 +60,13 @@ UNDO: Dict[str, str] = {
     "externalDiskLinkDown":          "externalDiskLinkUp",
     "consulDown":                    "consulUp",
 }
+
+# Reverse map: recovery action → set of do-actions it clears.
+# Used by the DO scan to remove actions from active_do tracking.
+CLEARED_BY: Dict[str, set] = defaultdict(set)
+for _do, _rec in UNDO.items():
+    if _rec:
+        CLEARED_BY[_rec].add(_do)
 
 # ---------------------------------------------------------------------------
 # Parsing helpers
@@ -103,7 +110,7 @@ def _has_action_before_recovery(
 # Flag management
 # ---------------------------------------------------------------------------
 
-Flags = Dict[str, Dict[str, bool]]
+Flags = Dict[str, object]
 
 
 def _new_flags(do_targets: List[str]) -> Flags:
@@ -115,6 +122,11 @@ def _new_flags(do_targets: List[str]) -> Flags:
         "isolated":    defaultdict(bool, init),
         "disk_down":   defaultdict(bool, init),
         "skip":        defaultdict(bool, init),
+        # Tracks actions (with non-empty UNDO) that have been inserted into
+        # the existing list but not yet recovered.  Used to detect backward
+        # duplicates — cases where inserting a DO would pair with an already-
+        # active DO on the same target ahead of the recovery.
+        "active_do":   defaultdict(set),
     }
 
 
@@ -181,6 +193,13 @@ def _do_scan_update_flags(
     else:
         for t in item_targets:
             flags["skip"][t] = False
+        # Track active DOs for backward-duplicate prevention.
+        if UNDO.get(action, ""):
+            for t in item_targets:
+                flags["active_do"][t].add(action)
+        for cleared in CLEARED_BY.get(action, set()):
+            for t in item_targets:
+                flags["active_do"][t].discard(cleared)
 
 
 def _undo_scan_update_flags(
@@ -255,6 +274,14 @@ def _do_allowed(
     """Return True if inserting do_action at the current scan position is valid."""
     if do_action == "":
         return False
+    # Backward-duplicate check: reject if this action is already active on
+    # any of the targets (i.e. it was inserted earlier without its recovery).
+    # This catches cases the forward HasActionOnTargetBeforeRecovery misses
+    # when an existing DO/UNDO pair straddles the candidate position.
+    if UNDO.get(do_action, ""):
+        for t in do_targets:
+            if do_action in flags["active_do"][t]:
+                return False
     if do_action in ("powerDown", "ungracefulPowerDown"):
         return all(
             not flags["skip"][t]
@@ -438,11 +465,21 @@ def generate(
     """
     action_list: List[str] = []
     list_of_actions_number = 0
+    do_action_set = set(do_action_list)
 
     while len(action_list) <= max_actions_total:
         current_action_list: List[str] = []
+        # Track which distinct do-action strings have failed (returned no valid
+        # insertion position) since the last successful insertion.  When every
+        # action in do_action_list has failed at least once without any success
+        # in between, the current_action_list is in a deadlock state (skip/
+        # isolation flags block every candidate) and we break to avoid an
+        # infinite loop.
+        failed_do_strings: Set[str] = set()
 
         while len(current_action_list) <= max_actions_before_check:
+            if failed_do_strings >= do_action_set:
+                break  # all actions blocked — exit inner loop early
             current_do = random.choice(do_action_list)
             current_do_action, current_do_targets, current_do_value = (
                 _parse_item(current_do)
@@ -477,8 +514,10 @@ def generate(
                 allowed_do.append(len(current_action_list))
 
             if not allowed_do:
+                failed_do_strings.add(current_do)
                 continue  # no valid position — try a different action
 
+            failed_do_strings.clear()
             do_index = random.choice(allowed_do)
             current_action_list.insert(do_index, current_do)
 
