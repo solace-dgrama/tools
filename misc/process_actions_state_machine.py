@@ -144,8 +144,9 @@ def extract_actions(log_file_path: str) -> List[Action]:
         print(f"Error reading file: {e}", file=sys.stderr)
         sys.exit(1)
 
-    # Sort by action number
-    actions.sort(key=lambda a: a.number)
+    # Sort by start datetime (action numbers restart per test section, so
+    # sorting by number would group all section-1 actions together, etc.)
+    actions.sort(key=lambda a: (a.start_date, a.start_time))
 
     return actions
 
