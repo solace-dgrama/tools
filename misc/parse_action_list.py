@@ -37,7 +37,7 @@ Examples:
 import re
 import sys
 import subprocess
-from typing import List, Tuple, Dict
+from typing import List, Tuple, Dict, Optional
 from datetime import datetime
 
 
@@ -155,301 +155,143 @@ def extract_executed_actions(log_file: str) -> List[Tuple[str, Dict[str, str]]]:
         return []
 
 
-def extract_traffic_stats(log_file: str) -> Dict[str, Dict[str, any]]:
-    """
-    Extract traffic validation stats from the log file.
+def _parse_keyed_list(line: str) -> Dict[str, any]:
+    """Parse a Tcl keyed list like {rc OK} {txMsgs 240} {txMsgRate 99.17}."""
+    result = {}
+    for key, value in re.findall(r'\{(\w+)\s+([^\}]+)\}', line):
+        try:
+            result[key] = float(value) if '.' in value else int(value)
+        except ValueError:
+            result[key] = value
+    return result
 
-    Returns dict keyed by timestamp with traffic stats.
+
+def extract_traffic_blocks(log_file: str) -> List[Dict]:
     """
-    traffic_data = {}
+    Extract traffic validation blocks from the log file.
+
+    Each block corresponds to one verifyHaStateAndTraffic call, anchored at
+    '=== Debug info before traffic validation ==='.
+
+    Stats are always reset just before the block runs, so SDK "after" values
+    are direct deltas (no subtraction needed).  Per-publisher broker
+    guaranteed-messages after the clear equals msgs sent during the interval.
+
+    Returns a list of block dicts containing:
+      anchor_ts, pub_stats_after, sub_stats_after, validation,
+      msg_spool, pub_clients_after, sub_clients_after
+    """
+    blocks = []
+    current_block = None
+    section = None
+    cur_pub = None
+    cur_sub = None
 
     try:
         with open(log_file, 'r') as f:
             lines = f.readlines()
 
-        i = 0
-        while i < len(lines):
-            line = lines[i]
-
-            # Look for traffic validation result
-            if 'Minimum Expected:' in line and 'actual' in line:
-                # Look backward for timestamp (it's on a previous line)
-                timestamp = "Unknown"
-                for j in range(max(0, i - 5), i):
-                    ts_match = re.search(r'\[(\d{2}:\d{2}:\d{2})\]', lines[j])
-                    if ts_match:
-                        timestamp = ts_match.group(1)
-
-                # Extract validation result: "Minimum Expected: 40 (actual 210)"
-                val_match = re.search(r'Minimum Expected:\s+(\d+)\s+\(actual\s+(\d+)\)', line)
-                if val_match:
-                    min_expected = int(val_match.group(1))
-                    actual = int(val_match.group(2))
-
-                    if timestamp not in traffic_data:
-                        traffic_data[timestamp] = {}
-
-                    traffic_data[timestamp]['sub_rx_validation'] = {
-                        'expected': min_expected,
-                        'actual': actual,
-                        'passed': actual >= min_expected
-                    }
-
-            # Look for publisher client-side stats BEFORE validation (for delta)
-            elif 'Publisher client-side stats before ValidateMessageStreamsAtObject:' in line:
+        for line in lines:
+            # New block starts at this marker
+            if 'Debug info before traffic validation' in line:
+                if current_block is not None:
+                    blocks.append(current_block)
                 ts_match = re.search(r'\[(\d{2}:\d{2}:\d{2})\]', line)
-                timestamp = ts_match.group(1) if ts_match else "Unknown"
-
-                stats = {}
-                stats_match = re.findall(r'\{(\w+)\s+([^\}]+)\}', line)
-                for key, value in stats_match:
-                    try:
-                        stats[key] = int(value) if value.isdigit() else value
-                    except ValueError:
-                        stats[key] = value
-
-                if timestamp not in traffic_data:
-                    traffic_data[timestamp] = {}
-
-                traffic_data[timestamp]['pub_stats_before'] = stats
-
-            # Look for publisher client-side stats AFTER validation
-            elif 'Publisher client-side stats after ValidateMessageStreamsAtObject:' in line:
-                ts_match = re.search(r'\[(\d{2}:\d{2}:\d{2})\]', line)
-                timestamp = ts_match.group(1) if ts_match else "Unknown"
-
-                # Parse keyed list: {rc OK} {txMsgs 240} {txBytes 7571920} ...
-                stats = {}
-                stats_match = re.findall(r'\{(\w+)\s+([^\}]+)\}', line)
-                for key, value in stats_match:
-                    try:
-                        stats[key] = int(value) if value.isdigit() else value
-                    except ValueError:
-                        stats[key] = value
-
-                if timestamp not in traffic_data:
-                    traffic_data[timestamp] = {}
-
-                traffic_data[timestamp]['pub_stats_after'] = stats
-
-            # Look for subscriber client-side stats AFTER validation
-            elif 'Subscriber client-side stats after ValidateMessageStreamsAtObject:' in line:
-                ts_match = re.search(r'\[(\d{2}:\d{2}:\d{2})\]', line)
-                timestamp = ts_match.group(1) if ts_match else "Unknown"
-
-                stats = {}
-                stats_match = re.findall(r'\{(\w+)\s+([^\}]+)\}', line)
-                for key, value in stats_match:
-                    try:
-                        stats[key] = int(value) if value.isdigit() else value
-                    except ValueError:
-                        stats[key] = value
-
-                if timestamp not in traffic_data:
-                    traffic_data[timestamp] = {}
-
-                traffic_data[timestamp]['sub_stats_after'] = stats
-
-            # Look for publisher broker-side stats
-            elif 'Publisher client message-spool-stats after traffic validation:' in line:
-                ts_match = re.search(r'\[(\d{2}:\d{2}:\d{2})\]', line)
-                timestamp = ts_match.group(1) if ts_match else "Unknown"
-
-                if timestamp not in traffic_data:
-                    traffic_data[timestamp] = {}
-
-                # Parse multiple publisher clients
-                traffic_data[timestamp]['pub_broker_stats'] = []
-                j = i + 1
-                current_client_name = None
-                current_stats = {}
-
-                # Look ahead for multiple publisher clients
-                while j < len(lines) and j < i + 5000:
-                    # Stop when we hit subscriber stats
-                    if 'Subscriber client message-spool-stats after traffic validation:' in lines[j]:
-                        break
-
-                    # Look for client name in the SEMP command
-                    if 'P2: -name c_vmrRedundancyRandomActions_pub_' in lines[j]:
-                        # Save previous client if any
-                        if current_client_name and current_stats:
-                            traffic_data[timestamp]['pub_broker_stats'].append({
-                                'name': current_client_name,
-                                **current_stats
-                            })
-                        # Start new client
-                        name_match = re.search(r'P2: -name (c_vmrRedundancyRandomActions_pub_\d+)', lines[j])
-                        if name_match:
-                            current_client_name = name_match.group(1)
-                            current_stats = {}
-
-                    # Extract stats for current client
-                    elif current_client_name:
-                        if '<last-message-id-sent>' in lines[j]:
-                            match = re.search(r'<last-message-id-sent>(\d+)</last-message-id-sent>', lines[j])
-                            if match:
-                                current_stats['last_msg_id'] = int(match.group(1))
-                        elif '<window-size>' in lines[j] and 'window_size' not in current_stats:
-                            match = re.search(r'<window-size>(\d+)</window-size>', lines[j])
-                            if match:
-                                current_stats['window_size'] = int(match.group(1))
-                        elif '<guaranteed-messages>' in lines[j]:
-                            match = re.search(r'<guaranteed-messages>(\d+)</guaranteed-messages>', lines[j])
-                            if match:
-                                current_stats['inflight'] = int(match.group(1))
-
-                    j += 1
-
-                # Save last client
-                if current_client_name and current_stats:
-                    traffic_data[timestamp]['pub_broker_stats'].append({
-                        'name': current_client_name,
-                        **current_stats
-                    })
-
-            # Look for subscriber broker-side stats
-            elif 'Subscriber client message-spool-stats after traffic validation:' in line:
-                ts_match = re.search(r'\[(\d{2}:\d{2}:\d{2})\]', line)
-                timestamp = ts_match.group(1) if ts_match else "Unknown"
-
-                if timestamp not in traffic_data:
-                    traffic_data[timestamp] = {}
-
-                # Parse multiple subscriber clients
-                traffic_data[timestamp]['sub_broker_stats'] = []
-                j = i + 1
-                current_client_name = None
-                current_stats = {}
-
-                # Look ahead for multiple subscriber clients
-                while j < len(lines) and j < i + 5000:
-                    # Stop when we hit a different section
-                    if 'Message-spool stats after traffic validation:' in lines[j]:
-                        break
-
-                    # Look for client name in the SEMP command
-                    if 'P2: -name c_vmrRedundancyRandomActions_sub_' in lines[j]:
-                        # Save previous client if any
-                        if current_client_name and current_stats:
-                            traffic_data[timestamp]['sub_broker_stats'].append({
-                                'name': current_client_name,
-                                **current_stats
-                            })
-                        # Start new client
-                        name_match = re.search(r'P2: -name (c_vmrRedundancyRandomActions_sub_\d+)', lines[j])
-                        if name_match:
-                            current_client_name = name_match.group(1)
-                            current_stats = {}
-
-                    # Extract stats for current client
-                    elif current_client_name:
-                        if '<flow-id>' in lines[j] and 'flow_id' not in current_stats:
-                            match = re.search(r'<flow-id>(\d+)</flow-id>', lines[j])
-                            if match:
-                                current_stats['flow_id'] = int(match.group(1))
-                        elif '<used-window>' in lines[j]:
-                            match = re.search(r'<used-window>(\d+)</used-window>', lines[j])
-                            if match:
-                                current_stats['used_window'] = int(match.group(1))
-                        elif '<low-message-id-ack-pending>' in lines[j]:
-                            match = re.search(r'<low-message-id-ack-pending>(\d+)</low-message-id-ack-pending>', lines[j])
-                            if match:
-                                current_stats['low_msg_id_pending'] = int(match.group(1))
-                        elif '<high-message-id-ack-pending>' in lines[j]:
-                            match = re.search(r'<high-message-id-ack-pending>(\d+)</high-message-id-ack-pending>', lines[j])
-                            if match:
-                                current_stats['high_msg_id_pending'] = int(match.group(1))
-                        elif '<message-confirmed-delivered>' in lines[j]:
-                            match = re.search(r'<message-confirmed-delivered>(\d+)</message-confirmed-delivered>', lines[j])
-                            if match:
-                                current_stats['confirmed_delivered'] = int(match.group(1))
-                        elif '<window-closed>' in lines[j]:
-                            match = re.search(r'<window-closed>(\d+)</window-closed>', lines[j])
-                            if match:
-                                current_stats['window_closed'] = int(match.group(1))
-
-                    j += 1
-
-                # Save last client
-                if current_client_name and current_stats:
-                    traffic_data[timestamp]['sub_broker_stats'].append({
-                        'name': current_client_name,
-                        **current_stats
-                    })
-
-            # Look for message-spool stats
-            elif 'Message-spool stats after traffic validation:' in line:
-                ts_match = re.search(r'\[(\d{2}:\d{2}:\d{2})\]', line)
-                timestamp = ts_match.group(1) if ts_match else "Unknown"
-
-                # Look ahead for the XML response with stats
-                j = i + 1
-                spool_stats = {}
-                while j < len(lines) and j < i + 300:
-                    # Extract key message-spool stats from XML
-                    if '<ingress-messages>' in lines[j] and 'ingress' not in spool_stats:
-                        # Match only standalone <ingress-messages>, not compound tags
-                        match = re.search(r'<ingress-messages>(\d+)</ingress-messages>', lines[j])
-                        if match:
-                            spool_stats['ingress'] = int(match.group(1))
-                    elif '<egress-messages>' in lines[j] and 'egress' not in spool_stats:
-                        # Match only standalone <egress-messages>
-                        match = re.search(r'<egress-messages>(\d+)</egress-messages>', lines[j])
-                        if match:
-                            spool_stats['egress'] = int(match.group(1))
-                    elif '<total-discarded-messages>' in lines[j]:
-                        match = re.search(r'<total-discarded-messages>(\d+)</total-discarded-messages>', lines[j])
-                        if match:
-                            spool_stats['discards'] = int(match.group(1))
-
-                    # Stop when we have all three values
-                    if 'ingress' in spool_stats and 'egress' in spool_stats and 'discards' in spool_stats:
-                        break
-
-                    j += 1
-
-                if spool_stats and timestamp not in traffic_data:
-                    traffic_data[timestamp] = {}
-
-                if spool_stats:
-                    traffic_data[timestamp]['msg_spool'] = spool_stats
-
-            i += 1
-
-        # Post-process: merge "before" and "after" stats that are close together
-        merged_data = {}
-        timestamps = sorted(traffic_data.keys(), key=lambda t: tuple(map(int, t.split(':'))))
-
-        for ts in timestamps:
-            data = traffic_data[ts]
-
-            # If this entry has "after" stats, it's a complete entry
-            if 'pub_stats_after' in data or 'sub_stats_after' in data:
-                # Look for a nearby "before" entry to merge
-                ts_secs = sum(int(x) * (60 ** (2 - i)) for i, x in enumerate(ts.split(':')))
-                for prev_ts in timestamps:
-                    prev_secs = sum(int(x) * (60 ** (2 - i)) for i, x in enumerate(prev_ts.split(':')))
-                    if abs(prev_secs - ts_secs) <= 5 and 'pub_stats_before' in traffic_data[prev_ts]:
-                        # Merge the "before" stats into this entry
-                        data['pub_stats_before'] = traffic_data[prev_ts]['pub_stats_before']
-                        break
-
-                merged_data[ts] = data
-
-            # If this entry only has "before" stats, skip it (it will be merged elsewhere)
-            elif 'pub_stats_before' in data:
+                current_block = {
+                    'anchor_ts': ts_match.group(1) if ts_match else 'Unknown',
+                    'pub_clients_after': {},
+                    'sub_clients_after': {},
+                }
+                section = None
+                cur_pub = None
+                cur_sub = None
                 continue
 
-            # Otherwise, keep it as is
-            else:
-                merged_data[ts] = data
+            if current_block is None:
+                continue
 
-        return merged_data
+            # Single-line SDK stats (highest priority — check before section routing)
+            if 'Publisher client-side stats after ValidateMessageStreamsAtObject:' in line:
+                current_block['pub_stats_after'] = _parse_keyed_list(line)
+                section = None
+                continue
+            if 'Subscriber client-side stats after ValidateMessageStreamsAtObject:' in line:
+                current_block['sub_stats_after'] = _parse_keyed_list(line)
+                section = None
+                continue
+
+            # Validation result (first occurrence per block)
+            if 'Minimum Expected:' in line and 'validation' not in current_block:
+                m = re.search(r'Minimum Expected:\s+(\d+)\s+\(actual\s+(\d+)\)', line)
+                if m:
+                    exp, act = int(m.group(1)), int(m.group(2))
+                    current_block['validation'] = {
+                        'expected': exp,
+                        'actual': act,
+                        'passed': act >= exp,
+                    }
+                continue
+
+            # Section markers
+            if 'Message-spool stats after traffic validation:' in line:
+                section = 'spool'
+                current_block.setdefault('msg_spool', {})
+                continue
+            if 'Publisher client message-spool-stats after traffic validation:' in line:
+                section = 'pub_broker'
+                cur_pub = None
+                continue
+            if 'Subscriber client message-spool-stats after traffic validation:' in line:
+                section = 'sub_broker'
+                cur_sub = None
+                continue
+            if 'Debug info after traffic validation' in line:
+                section = None
+                continue
+
+            # Section-specific XML parsing
+            if section == 'spool':
+                for tag, key in [('ingress-messages', 'ingress'),
+                                  ('egress-messages', 'egress'),
+                                  ('total-discarded-messages', 'discards')]:
+                    m = re.search(fr'<{tag}>(\d+)</{tag}>', line)
+                    if m:
+                        current_block['msg_spool'][key] = int(m.group(1))
+                        break
+
+            elif section == 'pub_broker':
+                m = re.search(r'P2: -name (c_vmrRedundancyRandomActions_pub_\w+)', line)
+                if m:
+                    cur_pub = m.group(1)
+                    current_block['pub_clients_after'].setdefault(cur_pub, {})
+                elif cur_pub:
+                    for tag, key in [('last-message-id-sent', 'last_msg_id'),
+                                     ('guaranteed-messages', 'sent')]:
+                        m = re.search(fr'<{tag}>(\d+)</{tag}>', line)
+                        if m:
+                            current_block['pub_clients_after'][cur_pub][key] = int(m.group(1))
+                            break
+
+            elif section == 'sub_broker':
+                m = re.search(r'P2: -name (c_vmrRedundancyRandomActions_sub_\w+)', line)
+                if m:
+                    cur_sub = m.group(1)
+                    current_block['sub_clients_after'].setdefault(cur_sub, {})
+                elif cur_sub:
+                    m = re.search(
+                        r'<message-confirmed-delivered>(\d+)</message-confirmed-delivered>',
+                        line)
+                    if m:
+                        current_block['sub_clients_after'][cur_sub][
+                            'confirmed_delivered'] = int(m.group(1))
+
+        if current_block is not None:
+            blocks.append(current_block)
 
     except FileNotFoundError:
         print(f"Error: Log file '{log_file}' not found", file=sys.stderr)
-        return {}
+
+    return blocks
 
 
 def parse_actions(action_text: str) -> List[Dict[str, str]]:
@@ -527,264 +369,310 @@ def format_action_list_compact(timestamp: str, actions: List[Dict[str, str]]) ->
     return '\n'.join(output)
 
 
-def deduplicate_executed_actions(executed: List[Tuple[str, Dict[str, str]]]) -> List[Tuple[str, Dict[str, str]]]:
+def extract_end_time_entries(log_file: str) -> List[Tuple[str, int]]:
     """
-    Deduplicate executed actions by global action number.
-
-    The test framework logs each action multiple times to different log facilities.
-    Keep only one entry per global action number, preferring entries with actual timestamps.
+    Extract end action entries as (timestamp, global_num) pairs in log order.
     """
-    seen = {}
+    try:
+        result = subprocess.run(
+            ['grep', '-E', 'End of action:.*Action -', log_file],
+            capture_output=True,
+            text=True,
+            check=True
+        )
 
-    for timestamp, action in executed:
+        entries = []
+        for line in result.stdout.strip().split('\n'):
+            ts_match = re.search(r'\[(\d{2}:\d{2}:\d{2})\]', line)
+            if not ts_match:
+                continue
+            action_match = re.search(r'action: (\d+) ~', line)
+            if action_match:
+                entries.append((ts_match.group(1), int(action_match.group(1))))
+
+        return entries
+
+    except subprocess.CalledProcessError:
+        return []
+    except FileNotFoundError:
+        print(f"Error: Log file '{log_file}' not found", file=sys.stderr)
+        return []
+
+
+def split_into_runs(
+        executed: List[Tuple[str, Dict[str, str]]]
+) -> List[List[Tuple[str, Dict[str, str]]]]:
+    """
+    Split flat list of executed action entries into individual test runs.
+
+    A new run is detected when global_num resets (decreases significantly),
+    which happens when the test completes all lists and starts again.
+    The threshold of 10 is safely larger than any fan-out reordering but
+    much smaller than the typical action count per run (~200).
+    """
+    runs: List[List] = []
+    current_run: List = []
+    run_max = 0
+
+    for entry in executed:
+        global_num = entry[1]['global_num']
+        if current_run and global_num < run_max - 10:
+            runs.append(current_run)
+            current_run = []
+            run_max = 0
+        current_run.append(entry)
+        if global_num > run_max:
+            run_max = global_num
+
+    if current_run:
+        runs.append(current_run)
+
+    return runs
+
+
+def split_end_times_into_runs(
+        entries: List[Tuple[str, int]]
+) -> List[Dict[int, Tuple[str, str]]]:
+    """
+    Split end time entries into runs and group by global_num within each run.
+
+    Uses the same global_num-reset heuristic as split_into_runs.
+    Returns list of dicts (one per run): {global_num: (end_first, end_last)}
+    """
+    run_buckets: List[List[Tuple[str, int]]] = []
+    current_bucket: List[Tuple[str, int]] = []
+    run_max = 0
+
+    for ts, global_num in entries:
+        if current_bucket and global_num < run_max - 10:
+            run_buckets.append(current_bucket)
+            current_bucket = []
+            run_max = 0
+        current_bucket.append((ts, global_num))
+        if global_num > run_max:
+            run_max = global_num
+
+    if current_bucket:
+        run_buckets.append(current_bucket)
+
+    result = []
+    for bucket in run_buckets:
+        grouped: Dict[int, List[str]] = {}
+        for ts, global_num in bucket:
+            if global_num not in grouped:
+                grouped[global_num] = [ts, ts]
+            else:
+                entry = grouped[global_num]
+                if ts_to_seconds(ts) < ts_to_seconds(entry[0]):
+                    entry[0] = ts
+                if ts_to_seconds(ts) > ts_to_seconds(entry[1]):
+                    entry[1] = ts
+        result.append({k: (v[0], v[1]) for k, v in grouped.items()})
+
+    return result
+
+
+def ts_to_seconds(ts: str) -> int:
+    """Convert HH:MM:SS timestamp to seconds since midnight."""
+    h, m, s = map(int, ts.split(':'))
+    return h * 3600 + m * 60 + s
+
+
+def format_duration(start_ts: str, end_ts: str) -> str:
+    """Format the duration between two HH:MM:SS timestamps."""
+    secs = ts_to_seconds(end_ts) - ts_to_seconds(start_ts)
+    if secs < 0:
+        secs += 86400  # handle midnight rollover
+    if secs < 60:
+        return f"{secs}s"
+    return f"{secs // 60}m{secs % 60:02d}s"
+
+
+def group_run_entries(
+        run: List[Tuple[str, Dict[str, str]]]
+) -> List[Tuple[str, str, Dict[str, str]]]:
+    """
+    Group a single run's entries by global_num, tracking first/last start times.
+
+    Each action is logged many times (once per router × log facility). Tracking
+    first and last captures the fan-out spread, which is typically a few seconds.
+
+    Returns list of tuples: (start_first, start_last, action_dict)
+    """
+    seen: Dict[int, List] = {}
+
+    for timestamp, action in run:
         global_num = action['global_num']
 
         if global_num not in seen:
-            seen[global_num] = (timestamp, action)
-        else:
-            # If current entry has a real timestamp and existing doesn't, replace it
-            existing_ts, existing_action = seen[global_num]
-            if timestamp != "Unknown" and existing_ts == "Unknown":
-                seen[global_num] = (timestamp, action)
+            seen[global_num] = [timestamp, timestamp, action]
+        elif timestamp != "Unknown":
+            entry = seen[global_num]
+            if entry[0] == "Unknown":
+                entry[0] = timestamp
+                entry[1] = timestamp
+            else:
+                if ts_to_seconds(timestamp) < ts_to_seconds(entry[0]):
+                    entry[0] = timestamp
+                if ts_to_seconds(timestamp) > ts_to_seconds(entry[1]):
+                    entry[1] = timestamp
 
-    # Return in original order (sorted by global action number)
-    return [seen[key] for key in sorted(seen.keys())]
+    return [(e[0], e[1], e[2]) for e in (seen[k] for k in sorted(seen.keys()))]
 
 
-def format_executed_actions(executed: List[Tuple[str, Dict[str, str]]],
-                            traffic_data: Dict[str, Dict[str, any]] = None) -> str:
-    """Format executed actions grouped by list."""
+def format_executed_actions(
+        executed: List[Tuple[str, Dict[str, str]]],
+        traffic_blocks: List[Dict] = None,
+        end_times_per_run: List[Dict[int, Tuple[str, str]]] = None) -> str:
+    """Format executed actions grouped by list and run."""
 
     if not executed:
         return "No executed actions found."
 
-    # Deduplicate entries
-    executed = deduplicate_executed_actions(executed)
+    runs = split_into_runs(executed)
 
     output = []
     output.append(f"\n{'='*80}")
-    output.append(f"Executed Actions Timeline")
+    output.append(f"Executed Actions Timeline ({len(runs)} run(s))")
     output.append(f"{'='*80}\n")
 
-    current_list = None
-    previous_traffic_stats = None  # Track previous CHECK stats for per-client deltas
+    # Pre-collect check start times (in run/action order) for range-based matching
+    all_check_starts = []
+    if traffic_blocks:
+        for run in runs:
+            for start_first, _, action in group_run_entries(run):
+                if action['action'] == 'check':
+                    all_check_starts.append(start_first)
 
-    for timestamp, action in executed:
-        list_num = action['list_num']
-        action_num = action['action_num']
-        total_lists = action['total_lists']
-        global_num = action['global_num']
+    check_idx = 0
 
-        # New list detected
-        if current_list != list_num:
-            if current_list is not None:
-                output.append("")
-            output.append(f"List {list_num}/{total_lists}")
-            output.append("-" * 60)
-            current_list = list_num
+    for run_idx, run in enumerate(runs, 1):
+        run_end_times = (end_times_per_run[run_idx - 1]
+                         if end_times_per_run and run_idx - 1 < len(end_times_per_run)
+                         else {})
+        grouped = group_run_entries(run)
+        current_list = None
 
-        # Format action
-        action_name = action['action']
-        target = action['target']
-        value = action['value']
+        for start_first, start_last, action in grouped:
+            list_num = action['list_num']
+            action_num = action['action_num']
+            total_lists = action['total_lists']
+            global_num = action['global_num']
 
-        if action_name == 'sleep':
-            desc = f"sleep {value}s"
-        elif action_name == 'check':
-            desc = f"CHECK::{value} ✓"
-        else:
-            target_str = f" [{target}]" if target else ""
-            value_str = f" = {value}" if value else ""
-            desc = f"{action_name}{target_str}{value_str}"
+            if current_list != list_num:
+                if current_list is not None:
+                    output.append("")
+                output.append(f"List {list_num}/{total_lists} [{run_idx}]")
+                output.append("-" * 60)
+                current_list = list_num
 
-        output.append(f"  [{timestamp}] #{global_num:3d} (Act {action_num:2d}): {desc}")
+            action_name = action['action']
+            target = action['target']
+            value = action['value']
 
-        # Add traffic stats after CHECK actions if available
-        if action_name == 'check' and traffic_data:
-            # Look for traffic stats within a few seconds of this timestamp
-            traffic_stats = find_traffic_stats_near_timestamp(timestamp, traffic_data)
-            if traffic_stats:
-                output.append("")
-                output.append(format_traffic_stats(traffic_stats, previous_traffic_stats))
-                previous_traffic_stats = traffic_stats
+            if action_name == 'sleep':
+                desc = f"sleep {value}s"
+            elif action_name == 'check':
+                desc = f"CHECK::{value} ✓"
+            else:
+                target_str = f" [{target}]" if target else ""
+                value_str = f" = {value}" if value else ""
+                desc = f"{action_name}{target_str}{value_str}"
+
+            start_str = (f"{start_first}..{start_last}"
+                         if start_first != start_last else start_first)
+
+            end = run_end_times.get(global_num)
+            if end:
+                end_first, end_last = end
+                end_str = (f"{end_first}..{end_last}"
+                           if end_first != end_last else end_first)
+                duration = format_duration(start_first, end_first)
+                time_str = f"{start_str} → {end_str} ({duration})"
+            else:
+                time_str = start_str
+            output.append(
+                f"  [{time_str}] #{global_num:3d} (Act {action_num:2d}): {desc}"
+            )
+
+            if action_name == 'check' and traffic_blocks:
+                next_ts = (all_check_starts[check_idx + 1]
+                           if check_idx + 1 < len(all_check_starts)
+                           else None)
+                blocks = find_traffic_blocks_for_check(
+                    start_first, next_ts, traffic_blocks
+                )
+                for block in blocks:
+                    output.append("")
+                    output.append(format_traffic_block(block))
+                check_idx += 1
+
+        if run_idx < len(runs):
+            output.append("")
 
     return '\n'.join(output)
 
 
-def find_traffic_stats_near_timestamp(check_timestamp: str,
-                                       traffic_data: Dict[str, Dict[str, any]],
-                                       window_seconds: int = 30) -> Dict[str, any]:
+def find_traffic_blocks_for_check(
+        check_ts: str,
+        next_check_ts: Optional[str],
+        traffic_blocks: List[Dict],
+) -> List[Dict]:
     """
-    Find traffic stats near the given timestamp (within window_seconds).
+    Return traffic blocks whose anchor_ts falls in [check_ts, next_check_ts).
 
-    Returns the traffic stats dict or None if not found.
+    Each check action owns the blocks that started after it began and before
+    the next check started.  This is reliable because verifyHaStateAndTraffic
+    is called from within the check action and checks are spaced minutes apart.
     """
-    if not traffic_data:
-        return None
-
-    # Parse check timestamp to seconds
-    try:
-        h, m, s = map(int, check_timestamp.split(':'))
-        check_secs = h * 3600 + m * 60 + s
-    except (ValueError, AttributeError):
-        return None
-
-    # Find closest traffic stats within window
-    closest_stats = None
-    min_diff = window_seconds + 1
-
-    for ts, stats in traffic_data.items():
-        try:
-            h, m, s = map(int, ts.split(':'))
-            traffic_secs = h * 3600 + m * 60 + s
-
-            diff = abs(traffic_secs - check_secs)
-            if diff < min_diff and diff <= window_seconds:
-                min_diff = diff
-                closest_stats = stats.copy()
-                closest_stats['timestamp'] = ts
-        except (ValueError, AttributeError):
-            continue
-
-    return closest_stats
+    check_secs = ts_to_seconds(check_ts)
+    next_secs = ts_to_seconds(next_check_ts) if next_check_ts else 86400
+    return [b for b in traffic_blocks
+            if b['anchor_ts'] != 'Unknown'
+            and check_secs <= ts_to_seconds(b['anchor_ts']) < next_secs]
 
 
-def format_traffic_stats(stats: Dict[str, any],
-                         previous_stats: Dict[str, any] = None) -> str:
-    """Format traffic stats for display."""
+def format_traffic_block(block: Dict) -> str:
+    """Format one traffic validation block (one verifyHaStateAndTraffic call)."""
     lines = []
-    ts = stats.get('timestamp', 'Unknown')
+    ts = block.get('anchor_ts', 'Unknown')
     lines.append(f"    Traffic Validation ({ts}):")
 
-    # Subscriber RX validation
-    if 'sub_rx_validation' in stats:
-        val = stats['sub_rx_validation']
+    # Validation result
+    if 'validation' in block:
+        val = block['validation']
         status = '✓' if val['passed'] else '✗'
-        lines.append(f"      Subscriber RX: {val['actual']} msgs "
-                     f"(expected ≥{val['expected']}) {status}")
+        lines.append(f"      Validation: expected≥{val['expected']}, "
+                     f"actual={val['actual']} {status}")
 
-    # Publisher client-side stats (aggregate with delta)
-    if 'pub_stats_after' in stats:
-        pub_after = stats['pub_stats_after']
-        pub_before = stats.get('pub_stats_before', {})
-        tx_msgs_after = pub_after.get('txMsgs', 0)
-        tx_msgs_before = pub_before.get('txMsgs', 0)
-        delta = tx_msgs_after - tx_msgs_before
-        tx_rate = pub_after.get('txMsgRate', 0.0)
-        lines.append(f"      Pub Client:  txMsgs={tx_msgs_after} (delta {delta}), "
-                     f"txRate={tx_rate} msg/s")
+    # Publisher SDK stats — txMsgs is a direct delta (stats reset before block)
+    if 'pub_stats_after' in block:
+        pub = block['pub_stats_after']
+        lines.append(f"      Pub SDK:    txMsgs={pub.get('txMsgs', 0)}, "
+                     f"txRate={pub.get('txMsgRate', 0.0)} msg/s")
 
-    # Publisher broker-side stats (per-client with deltas)
-    if 'pub_broker_stats' in stats and isinstance(stats['pub_broker_stats'], list):
-        pub_clients = stats['pub_broker_stats']
-        if len(pub_clients) > 0:
-            lines.append(f"      Publishers:  {len(pub_clients)} client(s)")
-            total_inflight = 0
+    # Subscriber SDK stats — rxMsgs is a direct delta (stats reset before block)
+    if 'sub_stats_after' in block:
+        sub = block['sub_stats_after']
+        lines.append(f"      Sub SDK:    rxMsgs={sub.get('rxMsgs', 0)}, "
+                     f"rxRate={sub.get('rxMsgRate', 0.0)} msg/s")
 
-            # Build lookup for previous stats
-            prev_pub_by_name = {}
-            if previous_stats and 'pub_broker_stats' in previous_stats:
-                for prev_pub in previous_stats['pub_broker_stats']:
-                    prev_pub_by_name[prev_pub.get('name', '')] = prev_pub
-
-            for pub in pub_clients:
-                name = pub.get('name', 'unknown')
-                short_name = name.replace('c_vmrRedundancyRandomActions_pub_', 'pub_')
-                last_msg_id = pub.get('last_msg_id', 0)
-                window_size = pub.get('window_size', 0)
-                inflight = pub.get('inflight', 0)
-                total_inflight += inflight
-
-                # Calculate delta from previous CHECK
-                delta_str = ""
-                if name in prev_pub_by_name:
-                    prev_last_msg_id = prev_pub_by_name[name].get('last_msg_id', 0)
-                    delta = last_msg_id - prev_last_msg_id
-                    delta_str = f" (delta {delta})"
-
-                lines.append(f"        {short_name}: lastMsgId={last_msg_id}{delta_str}, "
-                             f"window={window_size}, inflight={inflight}")
-
-            # Show total from client-side aggregate (which is the traffic test delta)
-            if 'pub_stats_after' in stats and 'pub_stats_before' in stats:
-                pub_after = stats['pub_stats_after']
-                pub_before = stats['pub_stats_before']
-                tx_msgs_delta = pub_after.get('txMsgs', 0) - pub_before.get('txMsgs', 0)
-                lines.append(f"        TOTAL: sent={tx_msgs_delta} (traffic test), "
-                             f"inflight={total_inflight}")
-            else:
-                lines.append(f"        TOTAL: inflight={total_inflight}")
-
-    # Subscriber client-side stats (aggregate with delta)
-    if 'sub_stats_after' in stats:
-        sub_after = stats['sub_stats_after']
-        rx_msgs = sub_after.get('rxMsgs', 0)
-        rx_rate = sub_after.get('rxMsgRate', 0.0)
-        lines.append(f"      Sub Client:  rxMsgs={rx_msgs}, rxRate={rx_rate} msg/s")
-
-    # Subscriber broker-side stats (per-client with deltas)
-    if 'sub_broker_stats' in stats and isinstance(stats['sub_broker_stats'], list):
-        sub_clients = stats['sub_broker_stats']
-        if len(sub_clients) > 0:
-            lines.append(f"      Subscribers: {len(sub_clients)} client(s)")
-            total_window_closed = 0
-
-            # Build lookup for previous stats
-            prev_sub_by_name = {}
-            if previous_stats and 'sub_broker_stats' in previous_stats:
-                for prev_sub in previous_stats['sub_broker_stats']:
-                    prev_sub_by_name[prev_sub.get('name', '')] = prev_sub
-
-            for sub in sub_clients:
-                name = sub.get('name', 'unknown')
-                short_name = name.replace('c_vmrRedundancyRandomActions_sub_', 'sub_')
-                flow_id = sub.get('flow_id', 0)
-                used_window = sub.get('used_window', 0)
-                low_msg_id = sub.get('low_msg_id_pending', 0)
-                high_msg_id = sub.get('high_msg_id_pending', 0)
-                confirmed = sub.get('confirmed_delivered', 0)
-                window_closed = sub.get('window_closed', 0)
-                total_window_closed += window_closed
-
-                # Calculate deltas from previous CHECK (only if same flow)
-                confirmed_delta_str = ""
-                window_closed_delta_str = ""
-                if name in prev_sub_by_name:
-                    prev_flow_id = prev_sub_by_name[name].get('flow_id', -1)
-                    # Only calculate delta if it's the same flow (subscriber didn't reconnect)
-                    if prev_flow_id == flow_id:
-                        prev_confirmed = prev_sub_by_name[name].get('confirmed_delivered', 0)
-                        prev_window_closed = prev_sub_by_name[name].get('window_closed', 0)
-                        confirmed_delta = confirmed - prev_confirmed
-                        window_closed_delta = window_closed - prev_window_closed
-                        confirmed_delta_str = f" (delta {confirmed_delta})"
-                        window_closed_delta_str = f" (delta {window_closed_delta})"
-                    else:
-                        confirmed_delta_str = " (new flow)"
-                        window_closed_delta_str = ""
-
-                lines.append(f"        {short_name}: flowId={flow_id}, usedWindow={used_window}, "
-                             f"ackPending={low_msg_id}-{high_msg_id}")
-                lines.append(f"                  confirmed={confirmed}{confirmed_delta_str}, "
-                             f"windowClosed={window_closed}{window_closed_delta_str}")
-
-            # Show total from client-side aggregate (which is the traffic test delta)
-            if 'sub_stats_after' in stats:
-                sub_after = stats['sub_stats_after']
-                rx_msgs = sub_after.get('rxMsgs', 0)
-                lines.append(f"        TOTAL: received={rx_msgs} (traffic test), "
-                             f"windowClosed={total_window_closed}")
-            else:
-                lines.append(f"        TOTAL: windowClosed={total_window_closed}")
+    # Per-publisher broker stats — guaranteed-messages = msgs sent since clear
+    if block.get('pub_clients_after'):
+        clients = block['pub_clients_after']
+        total = sum(c.get('sent', 0) for c in clients.values())
+        lines.append(f"      Pub broker: {len(clients)} client(s), total_sent={total}")
+        for name, stats in sorted(clients.items()):
+            short = name.replace('c_vmrRedundancyRandomActions_pub_', 'pub_')
+            lines.append(f"        {short}: sent={stats.get('sent', 0)}, "
+                         f"last_id={stats.get('last_msg_id', 0)}")
 
     # Message-spool stats
-    if 'msg_spool' in stats:
-        spool = stats['msg_spool']
-        ingress = spool.get('ingress', 0)
-        egress = spool.get('egress', 0)
-        discards = spool.get('discards', 0)
-        lines.append(f"      Msg Spool:   ingress={ingress}, egress={egress}, "
-                     f"discards={discards}")
+    if 'msg_spool' in block:
+        spool = block['msg_spool']
+        lines.append(f"      Spool:      ingress={spool.get('ingress', 0)}, "
+                     f"egress={spool.get('egress', 0)}, "
+                     f"discards={spool.get('discards', 0)}")
 
     return '\n'.join(lines)
 
@@ -834,15 +722,18 @@ def main():
 
         print(f"Found {len(executed)} executed action(s)\n")
 
-        # Extract traffic stats if requested
-        traffic_data = None
+        # Extract traffic blocks if requested
+        traffic_blocks = None
         if show_traffic:
-            print("Extracting traffic validation stats...\n")
-            traffic_data = extract_traffic_stats(log_file)
-            if traffic_data:
-                print(f"Found {len(traffic_data)} traffic validation entries\n")
+            print("Extracting traffic validation blocks...\n")
+            traffic_blocks = extract_traffic_blocks(log_file)
+            if traffic_blocks:
+                print(f"Found {len(traffic_blocks)} traffic validation block(s)\n")
 
-        print(format_executed_actions(executed, traffic_data))
+        end_times_per_run = split_end_times_into_runs(
+            extract_end_time_entries(log_file)
+        )
+        print(format_executed_actions(executed, traffic_blocks, end_times_per_run))
 
     else:
         # Extract and display declared action lists
