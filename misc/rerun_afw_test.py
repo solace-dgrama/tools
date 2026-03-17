@@ -255,7 +255,7 @@ def localize_run_automation(cmd: str, scripts_dir: Path) -> str:
 def get_afw_env(scripts_dir: Path) -> dict[str, str]:
     """Return env vars that are new or changed after the AFW setup sourcing."""
     import os
-    e2e_dir = scripts_dir.parent
+    e2e_dir = scripts_dir
     bash_cmd = (
         f'export SOL_AFW_CURRENT_LIB={shlex.quote(str(e2e_dir))} && '
         f'source "$SOL_AFW_CURRENT_LIB/envInfo/.bashrc.afw.tcllib" && '
@@ -277,12 +277,10 @@ def get_afw_env(scripts_dir: Path) -> dict[str, str]:
 
 
 def prompt_scripts_dir() -> Path | None:
-    """Ask where the local scripts directory is (where runAutomation lives)."""
-    default = Path('tests/e2e/scripts')
-    hint = f' [{default}]' if default.is_dir() else ''
-    raw = input(f'\n  Local scripts directory (where runAutomation lives){hint}: ').strip()
-    if not raw and not default.is_dir():
-        return None
+    """Ask where the local scripts directory is (SOL_AFW_CURRENT_LIB)."""
+    default = Path('.')
+    hint = f' [{default.resolve()}]'
+    raw = input(f'\n  Local scripts directory{hint}: ').strip()
     chosen = Path(raw) if raw else default
     if not chosen.is_dir():
         print(f'  WARNING: {chosen} does not exist; paths will not be rewritten.')
@@ -314,8 +312,6 @@ def prompt_split(label: str, original: list[str]) -> list[str]:
         if dups:
             print(f'  ERROR: duplicates: {", ".join(dups)}. Please try again.')
             continue
-        if len(items) != len(original):
-            print(f'  Warning: got {len(items)} but original had {len(original)}.')
         return items
 
 
@@ -521,42 +517,6 @@ def prompt_book_resources(
 # Discrepancy report
 # ---------------------------------------------------------------------------
 
-def report_discrepancies(
-    sting: dict,
-    run: dict,
-    new_brokers: list[str],
-    new_monitor: list[str],
-    new_phosts: list[str],
-) -> None:
-    """Print warnings for anything that differs in count from the original."""
-    warnings: list[str] = []
-
-    orig_brokers = sting['brokers']
-    if len(new_brokers) != len(orig_brokers):
-        warnings.append(
-            f'broker count: original had {len(orig_brokers)}'
-            f', new has {len(new_brokers)}'
-        )
-
-    orig_monitor = sting['monitor']
-    if len(new_monitor) != len(orig_monitor):
-        warnings.append(
-            f'monitoring-node count: original had {len(orig_monitor)}'
-            f', new has {len(new_monitor)}'
-        )
-
-    orig_phosts = run['phosts']
-    if len(new_phosts) != len(orig_phosts):
-        warnings.append(
-            f'perf-host count: original had {len(orig_phosts)}'
-            f', new has {len(new_phosts)}'
-        )
-
-    if warnings:
-        print('\n--- Discrepancies ---')
-        for w in warnings:
-            print(f'  WARNING: {w}')
-
 
 # ---------------------------------------------------------------------------
 # Main
@@ -615,13 +575,23 @@ def main() -> None:
             new_monitor = prompt_monitor(new_brokers, sting['monitor'])
             new_phosts  = prompt_perf_hosts(run['phosts'])
 
-        if not new_phosts:
-            sys.exit('ERROR: at least one perf host is required')
-
-        report_discrepancies(sting, run, new_brokers, new_monitor, new_phosts)
+        warnings = []
+        if len(new_brokers) != len(sting['brokers']):
+            warnings.append(f'brokers: {len(new_brokers)}/{len(sting["brokers"])}')
+        if len(new_monitor) != len(sting['monitor']):
+            warnings.append(f'monitoring nodes: {len(new_monitor)}/{len(sting["monitor"])}')
+        if len(new_phosts) != len(run['phosts']):
+            warnings.append(f'perf hosts: {len(new_phosts)}/{len(run["phosts"])}')
+        if warnings:
+            print('\nWARNING: resources do not match the original:')
+            for w in warnings:
+                print(f'  {w}')
+            if input('Continue anyway? [y/N] ').strip().lower() != 'y':
+                _offer_free()
+                return
 
         # First perf host drives -perfHost / -toolIp in scriptArgs
-        new_perf_host_ip = new_phosts[0]
+        new_perf_host_ip = new_phosts[0] if new_phosts else ''
 
         raw = input(f'\n  Broker load version [{sting["version"]}]: ').strip()
         version = raw if raw else sting['version']
@@ -633,10 +603,20 @@ def main() -> None:
         if scripts_dir is not None:
             new_run = localize_run_automation(new_run, scripts_dir)
 
+        print('\n--- New resources ---')
+        print(f'  Brokers    : {", ".join(new_brokers)}')
+        print(f'  Monitoring : {", ".join(new_monitor) or "(none)"}')
+        print(f'  Version    : {version}')
+        print(f'  Perf hosts : {", ".join(display_perf(ip) for ip in new_phosts)}')
+        lib_val = str(scripts_dir) if scripts_dir is not None else '(not set)'
+        run_dir = str(scripts_dir / 'scripts') if scripts_dir is not None else '(not set)'
+        print(f'  SOL_AFW_CURRENT_LIB={lib_val}')
+        print(f'  Run directory      : {run_dir}')
+
         print('\n--- New commands ---')
         print(f'\n[1] {new_sting}')
         if scripts_dir is not None:
-            print(f'\n[2] (run from {scripts_dir}, SOL_AFW_CURRENT_LIB={scripts_dir.parent})')
+            print(f'\n[2] (run from {scripts_dir / "scripts"}, SOL_AFW_CURRENT_LIB={scripts_dir})')
         print(f'    {new_run}')
 
         print('\nWhat would you like to do?')
@@ -672,11 +652,11 @@ def main() -> None:
         if run_auto:
             print('\n=== Running runAutomation ===')
             if scripts_dir is not None:
-                e2e_dir = shlex.quote(str(scripts_dir.parent))
+                e2e_dir = shlex.quote(str(scripts_dir))
                 bash_cmd = (
                     f'export SOL_AFW_CURRENT_LIB={e2e_dir} && '
                     f'source "$SOL_AFW_CURRENT_LIB/envInfo/.bashrc.afw.tcllib" && '
-                    f'cd {shlex.quote(str(scripts_dir))} && '
+                    f'cd {shlex.quote(str(scripts_dir / "scripts"))} && '
                     f'{new_run}'
                 )
                 subprocess.run(['bash', '-c', bash_cmd], check=True)
