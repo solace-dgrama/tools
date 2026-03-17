@@ -639,37 +639,49 @@ def main() -> None:
             print(f'\n[2] (run from {scripts_dir}, SOL_AFW_CURRENT_LIB={scripts_dir.parent})')
         print(f'    {new_run}')
 
-        run_sting = input('\nRun sting-vmr? [y/N] ').strip().lower() == 'y'
+        print('\nWhat would you like to do?')
+        print('  [1] Run sting-vmr + runAutomation')
+        print('  [2] Run sting-vmr only')
+        print('  [3] Run runAutomation only')
+        print('  [4] Exit')
+        while True:
+            raw = input('Choice [4]: ').strip()
+            if not raw:
+                raw = '4'
+            if raw in ('1', '2', '3', '4'):
+                choice = int(raw)
+                break
+            print('  Please enter 1, 2, 3, or 4.')
+
+        run_sting = choice in (1, 2)
+        run_auto  = choice in (1, 3)
 
         if args.dry_run:
             print('\n(dry-run: not executing)')
             _offer_free()
             return
 
-        answer = input('Run these commands? [y/N] ').strip().lower()
-        if answer != 'y':
-            print('Aborted.')
+        if choice == 4:
             _offer_free()
             return
 
         if run_sting:
             print('\n=== Running sting-vmr ===')
             subprocess.run(shlex.split(new_sting), check=True)
-        else:
-            print('Skipping sting-vmr.')
 
-        print('\n=== Running runAutomation ===')
-        if scripts_dir is not None:
-            e2e_dir = shlex.quote(str(scripts_dir.parent))
-            bash_cmd = (
-                f'export SOL_AFW_CURRENT_LIB={e2e_dir} && '
-                f'source "$SOL_AFW_CURRENT_LIB/envInfo/.bashrc.afw.tcllib" && '
-                f'cd {shlex.quote(str(scripts_dir))} && '
-                f'{new_run}'
-            )
-            subprocess.run(['bash', '-c', bash_cmd], check=True)
-        else:
-            subprocess.run(shlex.split(new_run), check=True)
+        if run_auto:
+            print('\n=== Running runAutomation ===')
+            if scripts_dir is not None:
+                e2e_dir = shlex.quote(str(scripts_dir.parent))
+                bash_cmd = (
+                    f'export SOL_AFW_CURRENT_LIB={e2e_dir} && '
+                    f'source "$SOL_AFW_CURRENT_LIB/envInfo/.bashrc.afw.tcllib" && '
+                    f'cd {shlex.quote(str(scripts_dir))} && '
+                    f'{new_run}'
+                )
+                subprocess.run(['bash', '-c', bash_cmd], check=True)
+            else:
+                subprocess.run(shlex.split(new_run), check=True)
 
     except KeyboardInterrupt:
         print('\nInterrupted.')
