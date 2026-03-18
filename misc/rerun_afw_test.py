@@ -59,6 +59,119 @@ def display_perf(ip: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Load availability helpers
+# ---------------------------------------------------------------------------
+
+_LOADS_BASE = Path('/home/public/RND/loads/solcbr')
+
+
+def _strip_soltr(version: str) -> str:
+    """Strip 'soltr_' prefix from a load version string."""
+    return version.removeprefix('soltr_')
+
+
+def _load_path(version: str) -> Path | None:
+    """Return the expected filesystem path for a load, or None if unparseable.
+
+    Three layouts are supported:
+        regular: _LOADS_BASE/<X.Y.Z>/<X.Y.Z.BUILD>/   e.g. 10.25.0.202
+        feature: _LOADS_BASE/feature/<NAME>/<VERSION>/ e.g. 100.0SOL-144552.0.5612
+        main:    _LOADS_BASE/main/<VERSION>/           e.g. 100.0main.0.5554
+
+    The type is determined by the second dotted segment: purely numeric → regular;
+    'main' → main; anything else → feature (name = second segment minus leading digits).
+    """
+    v = _strip_soltr(version)
+    parts = v.split('.')
+    if len(parts) < 2:
+        return None
+    branch = re.sub(r'^\d+', '', parts[1])   # '' for regular, 'main', 'SOL-144552', …
+    if branch == 'main':
+        return _LOADS_BASE / 'main' / v
+    if branch:
+        return _LOADS_BASE / 'feature' / branch / v
+    # Regular release
+    dot = v.rfind('.')
+    return _LOADS_BASE / v[:dot] / v
+
+
+def _version_display(version: str) -> str:
+    """Version string for display: no 'soltr_' prefix, with availability note."""
+    display = _strip_soltr(version)
+    path = _load_path(version)
+    if path is not None and not path.exists():
+        return f'{display} (unavailable)'
+    return display
+
+
+def _latest_build(parent_dir: Path) -> str | None:
+    """Return the version name of the latest build in a parent directory.
+
+    Prefers the 'current' symlink; falls back to the highest build number.
+    """
+    current = parent_dir / 'current'
+    if current.is_symlink():
+        target = current.resolve()
+        if target.is_dir():
+            return target.name
+
+    builds = []
+    try:
+        for d in parent_dir.iterdir():
+            if d.is_dir() and d.name not in ('current', 'previous'):
+                builds.append(d.name)
+    except OSError:
+        return None
+    if not builds:
+        return None
+
+    def _build_key(name: str) -> int:
+        try:
+            return int(name.rsplit('.', 1)[-1])
+        except ValueError:
+            return -1
+
+    return max(builds, key=_build_key)
+
+
+def _find_load_candidates(partial: str) -> list[str]:
+    """Return the latest build version from each directory whose name contains
+    `partial` (case-insensitive).
+
+    Searches both the top-level version dirs (regular releases) and one level
+    inside the 'feature' and 'main' group directories.
+    """
+    needle = _strip_soltr(partial).lower()
+    seen: set[str] = set()
+    candidates: list[str] = []
+
+    def _add(version: str) -> None:
+        if version not in seen:
+            seen.add(version)
+            candidates.append(version)
+
+    try:
+        for entry in sorted(_LOADS_BASE.iterdir()):
+            if not entry.is_dir():
+                continue
+            if needle in entry.name.lower():
+                # Direct top-level match (e.g. '10.25.0' matches '10.25')
+                latest = _latest_build(entry)
+                if latest:
+                    _add(latest)
+            elif entry.name in ('feature', 'main'):
+                # Search one level inside group directories
+                for sub in sorted(entry.iterdir()):
+                    if sub.is_dir() and needle in sub.name.lower():
+                        latest = _latest_build(sub)
+                        if latest:
+                            _add(latest)
+    except OSError:
+        pass
+    return candidates
+
+
+# ---------------------------------------------------------------------------
 # Fetch commands from the AFW summary page
 # ---------------------------------------------------------------------------
 
@@ -66,8 +179,11 @@ def _strip_tags(text: str) -> str:
     return re.sub(r'<[^>]+>', '', text).strip()
 
 
-def fetch_commands(url: str) -> tuple[str, str]:
-    """Return (sting_cmd, run_cmd) extracted from an AFW summary page URL."""
+def fetch_commands(url: str) -> tuple[str | None, str, str | None]:
+    """Return (sting_cmd, run_cmd, load_version) extracted from an AFW summary page URL.
+
+    sting_cmd and load_version may be None if absent from the page.
+    """
     try:
         with urllib.request.urlopen(url, timeout=15) as resp:
             body = resp.read().decode('utf-8', errors='replace')
@@ -84,17 +200,18 @@ def fetch_commands(url: str) -> tuple[str, str]:
             return None
         return html.unescape(_strip_tags(m.group(1)))
 
-    sting_cmd = extract('Setup')
+    sting_cmd    = extract('Setup')
+    load_version = extract('Load')
     # 'Test Script Command Line' has the full -scriptArgs; prefer it over
     # the parent-level 'Command Line' which may use &quot; encoding.
     run_cmd = extract('Test Script Command Line') or extract('Command Line')
 
     if not sting_cmd:
-        sys.exit('ERROR: "Setup" field not found on the page')
+        print('WARNING: "Setup" field not found on the page; sting-vmr will be skipped.')
     if not run_cmd:
         sys.exit('ERROR: runAutomation command not found on the page')
 
-    return sting_cmd, run_cmd
+    return sting_cmd, run_cmd, load_version
 
 
 # ---------------------------------------------------------------------------
@@ -538,12 +655,14 @@ def main() -> None:
     args = ap.parse_args()
 
     print(f'Fetching {args.url} ...')
-    sting_raw, run_raw = fetch_commands(args.url)
+    sting_raw, run_raw, load_version = fetch_commands(args.url)
 
-    try:
-        sting = parse_sting_vmr(sting_raw)
-    except ValueError as exc:
-        sys.exit(f'ERROR parsing Setup command: {exc}')
+    sting = None
+    if sting_raw is not None:
+        try:
+            sting = parse_sting_vmr(sting_raw)
+        except ValueError as exc:
+            sys.exit(f'ERROR parsing Setup command: {exc}')
 
     run = parse_run_automation(run_raw)
 
@@ -551,9 +670,14 @@ def main() -> None:
     child_id = child_id_m.group(1) if child_id_m else 'unknown'
 
     print('\n--- Original resources ---')
-    print(f'  Brokers    : {", ".join(sting["brokers"])}')
-    print(f'  Monitoring : {", ".join(sting["monitor"]) or "(none)"}')
-    print(f'  Version    : {sting["version"]}')
+    v_str = _version_display(load_version) if load_version else '(not found)'
+    if sting:
+        print(f'  Brokers    : {", ".join(sting["brokers"])}')
+        print(f'  Monitoring : {", ".join(sting["monitor"]) or "(none)"}')
+        print(f'  Version    : {v_str}')
+    else:
+        print(f'  Brokers    : {", ".join(run["hosts"])}')
+        print(f'  Version    : {v_str}')
     print(f'  Perf hosts : {", ".join(display_perf(ip) for ip in run["phosts"])}')
 
     booked_items: list[tuple[str, str]] = []
@@ -566,20 +690,23 @@ def main() -> None:
             free_resources(booked_items)
 
     try:
-        booked = prompt_book_resources(sting, run, child_id, booked_items)
+        orig_brokers = sting['brokers'] if sting else run['hosts']
+        orig_monitor = sting['monitor'] if sting else []
+
+        booked = prompt_book_resources(sting, run, child_id, booked_items) if sting else None
         if booked is not None:
             new_brokers, new_monitor, new_phosts = booked
         else:
             print('\n--- New resources ---')
-            new_brokers = prompt_split('brokers', sting['brokers'])
-            new_monitor = prompt_monitor(new_brokers, sting['monitor'])
+            new_brokers = prompt_split('brokers', orig_brokers)
+            new_monitor = prompt_monitor(new_brokers, orig_monitor) if sting else []
             new_phosts  = prompt_perf_hosts(run['phosts'])
 
         warnings = []
-        if len(new_brokers) != len(sting['brokers']):
-            warnings.append(f'brokers: {len(new_brokers)}/{len(sting["brokers"])}')
-        if len(new_monitor) != len(sting['monitor']):
-            warnings.append(f'monitoring nodes: {len(new_monitor)}/{len(sting["monitor"])}')
+        if len(new_brokers) != len(orig_brokers):
+            warnings.append(f'brokers: {len(new_brokers)}/{len(orig_brokers)}')
+        if sting and len(new_monitor) != len(orig_monitor):
+            warnings.append(f'monitoring nodes: {len(new_monitor)}/{len(orig_monitor)}')
         if len(new_phosts) != len(run['phosts']):
             warnings.append(f'perf hosts: {len(new_phosts)}/{len(run["phosts"])}')
         if warnings:
@@ -593,11 +720,58 @@ def main() -> None:
         # First perf host drives -perfHost / -toolIp in scriptArgs
         new_perf_host_ip = new_phosts[0] if new_phosts else ''
 
-        raw = input(f'\n  Broker load version [{sting["version"]}]: ').strip()
-        version = raw if raw else sting['version']
+        if sting:
+            if not load_version:
+                print('  WARNING: "Load" field not found on the page.')
+            hint_v = _strip_soltr(load_version) if load_version else ''
+            hint = f' [{hint_v}]' if hint_v else ''
+            while True:
+                raw = input(f'\n  Broker load version{hint}: ').strip()
+                version = raw if raw else load_version or ''
+                if not version:
+                    break
 
-        new_sting = build_sting_vmr(sting, new_brokers, new_monitor, version)
-        new_run   = build_run_automation(run, new_brokers, new_phosts, new_perf_host_ip)
+                # Exact match?
+                lpath = _load_path(version)
+                if lpath is not None and lpath.is_dir():
+                    break
+
+                # Try partial/fuzzy match
+                candidates = _find_load_candidates(version)
+                if not candidates:
+                    print(f'  ERROR: {_strip_soltr(version)!r} not found. Please try again.')
+                    hint = f' [{_strip_soltr(version)}]'
+                    continue
+
+                if len(candidates) == 1:
+                    ans = input(f'  Use {candidates[0]}? [Y/n] ').strip().lower()
+                    if ans != 'n':
+                        version = candidates[0]
+                        break
+                    hint = f' [{_strip_soltr(version)}]'
+                    continue
+
+                # Multiple candidates — let the user pick
+                print('  Matching loads:')
+                for i, c in enumerate(candidates, 1):
+                    print(f'    [{i}] {c}')
+                while True:
+                    sel = input(f'  Select [1-{len(candidates)}] or Enter to retry: ').strip()
+                    if not sel:
+                        hint = f' [{_strip_soltr(version)}]'
+                        break
+                    if sel.isdigit() and 1 <= int(sel) <= len(candidates):
+                        version = candidates[int(sel) - 1]
+                        break
+                    print(f'  Enter a number between 1 and {len(candidates)}.')
+                if any(version == c for c in candidates):
+                    break
+            new_sting = build_sting_vmr(sting, new_brokers, new_monitor, version)
+        else:
+            version = None
+            new_sting = None
+
+        new_run = build_run_automation(run, new_brokers, new_phosts, new_perf_host_ip)
 
         scripts_dir = prompt_scripts_dir()
         if scripts_dir is not None:
@@ -605,8 +779,9 @@ def main() -> None:
 
         print('\n--- New resources ---')
         print(f'  Brokers    : {", ".join(new_brokers)}')
-        print(f'  Monitoring : {", ".join(new_monitor) or "(none)"}')
-        print(f'  Version    : {version}')
+        if sting:
+            print(f'  Monitoring : {", ".join(new_monitor) or "(none)"}')
+            print(f'  Version    : {version}')
         print(f'  Perf hosts : {", ".join(display_perf(ip) for ip in new_phosts)}')
         lib_val = str(scripts_dir) if scripts_dir is not None else '(not set)'
         run_dir = str(scripts_dir / 'scripts') if scripts_dir is not None else '(not set)'
@@ -614,34 +789,49 @@ def main() -> None:
         print(f'  Run directory      : {run_dir}')
 
         print('\n--- New commands ---')
-        print(f'\n[1] {new_sting}')
+        if new_sting:
+            print(f'\n[1] {new_sting}')
         if scripts_dir is not None:
             print(f'\n[2] (run from {scripts_dir / "scripts"}, SOL_AFW_CURRENT_LIB={scripts_dir})')
         print(f'    {new_run}')
 
         print('\nWhat would you like to do?')
-        print('  [1] Run sting-vmr + runAutomation')
-        print('  [2] Run sting-vmr only')
-        print('  [3] Run runAutomation only')
-        print('  [4] Exit')
+        if new_sting:
+            print('  [1] Run sting-vmr + runAutomation')
+            print('  [2] Run sting-vmr only')
+            print('  [3] Run runAutomation only')
+            print('  [4] Exit')
+            valid_choices = ('1', '2', '3', '4')
+            default_choice = '4'
+        else:
+            print('  [1] Run runAutomation')
+            print('  [2] Exit')
+            valid_choices = ('1', '2')
+            default_choice = '2'
         while True:
-            raw = input('Choice [4]: ').strip()
+            raw = input(f'Choice [{default_choice}]: ').strip()
             if not raw:
-                raw = '4'
-            if raw in ('1', '2', '3', '4'):
+                raw = default_choice
+            if raw in valid_choices:
                 choice = int(raw)
                 break
-            print('  Please enter 1, 2, 3, or 4.')
+            print(f'  Please enter {" or ".join(valid_choices)}.')
 
-        run_sting = choice in (1, 2)
-        run_auto  = choice in (1, 3)
+        if new_sting:
+            run_sting = choice in (1, 2)
+            run_auto  = choice in (1, 3)
+            exiting   = choice == 4
+        else:
+            run_sting = False
+            run_auto  = choice == 1
+            exiting   = choice == 2
 
         if args.dry_run:
             print('\n(dry-run: not executing)')
             _offer_free()
             return
 
-        if choice == 4:
+        if exiting:
             _offer_free()
             return
 
