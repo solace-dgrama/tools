@@ -179,10 +179,11 @@ def _strip_tags(text: str) -> str:
     return re.sub(r'<[^>]+>', '', text).strip()
 
 
-def fetch_commands(url: str) -> tuple[str | None, str, str | None]:
-    """Return (sting_cmd, run_cmd, load_version) extracted from an AFW summary page URL.
+def fetch_commands(url: str) -> tuple[str | None, str, str | None, list[str]]:
+    """Return (sting_cmd, run_cmd, load_version, orig_perf_types) from an AFW summary page.
 
     sting_cmd and load_version may be None if absent from the page.
+    orig_perf_types is a list of 'OS OS_version' strings (one per perf host, in order).
     """
     try:
         with urllib.request.urlopen(url, timeout=15) as resp:
@@ -211,7 +212,21 @@ def fetch_commands(url: str) -> tuple[str | None, str, str | None]:
     if not run_cmd:
         sys.exit('ERROR: runAutomation command not found on the page')
 
-    return sting_cmd, run_cmd, load_version
+    # Parse the PerfHosts section for original perf-host type strings.
+    # Each entry looks like: <a href="...">192.168.x.y</a> (N) - OS OS_version<br>
+    orig_perf_types: list[str] = []
+    perf_hosts_m = re.search(
+        r'<b>PerfHosts</b>\s*:\s*</td><td>(.*?)</td>',
+        body, re.DOTALL,
+    )
+    if perf_hosts_m:
+        for m in re.finditer(
+            r'<a[^>]*>[\d.]+</a>\s+\(\d+\)\s+-\s+([^<]+)',
+            perf_hosts_m.group(1),
+        ):
+            orig_perf_types.append(html.unescape(m.group(1).strip()))
+
+    return sting_cmd, run_cmd, load_version, orig_perf_types
 
 
 # ---------------------------------------------------------------------------
@@ -533,16 +548,20 @@ def _try_book_one(
 def book_resources(
     n_brokers: int,
     n_perfhosts: int,
-    vmr_query: str,
+    broker_query: str,
     perf_query: str,
     duration_hours: float,
     run_tag: str,
     booked_items: list[tuple[str, str]],
+    broker_type: str = 'vmr',
+    booking_message: str = 'afw troubleshooting',
 ) -> tuple[list[str], list[str]]:
-    """Book n_brokers VMRs and n_perfhosts perf-hosts; return (brokers, ips).
+    """Book n_brokers broker resources and n_perfhosts perf-hosts; return (brokers, ips).
 
     Each successfully booked resource is appended to booked_items immediately,
     so the caller can free partial results if interrupted mid-booking.
+    The booking_message is stored as the bookit comment, with a unique slot tag
+    appended so each booking can be identified after the fact.
     """
     end_iso = (
         dt.datetime.now() + dt.timedelta(hours=duration_hours)
@@ -550,30 +569,210 @@ def book_resources(
 
     brokers: list[str] = []
     for i in range(n_brokers):
-        comment = f'{run_tag}-vmr-{i + 1}'
-        print(f'  Booking VMR {i + 1}/{n_brokers} (comment: {comment}) ...')
-        name = _book_one('vmr', vmr_query, comment, end_iso)
-        print(f'  Booked: {name}')
-        brokers.append(name)
-        booked_items.append(('vmr', name))
+        comment = f'{booking_message} [{run_tag}-broker-{i + 1}]'
+        print(f'  Booking broker {i + 1}/{n_brokers} (comment: {comment}) ...')
+        name = _try_book_one(broker_type, broker_query, comment, end_iso)
+        if name is None and broker_query != '*':
+            print(f'    No match for {broker_query!r}; trying any {broker_type} ...')
+            name = _try_book_one(broker_type, '*', comment, end_iso)
+        if name is not None:
+            print(f'    Booked: {name}')
+            brokers.append(name)
+            booked_items.append((broker_type, name))
+        else:
+            print(f'    No {broker_type} available.')
+            raw = input(
+                f'    Enter broker {i + 1}/{n_brokers} name (or leave empty to skip): '
+            ).strip()
+            if raw:
+                brokers.append(raw)
 
     perf_ips: list[str] = []
     for i in range(n_perfhosts):
-        comment = f'{run_tag}-perf-{i + 1}'
+        comment = f'{booking_message} [{run_tag}-perf-{i + 1}]'
         print(f'  Booking perf-host {i + 1}/{n_perfhosts} (comment: {comment}) ...')
         name = _try_book_one('perf-host', perf_query, comment, end_iso)
+        if name is None and perf_query != '*':
+            print(f'    No match for {perf_query!r}; trying any perf-host ...')
+            name = _try_book_one('perf-host', '*', comment, end_iso)
         if name is not None:
-            print(f'  Booked: {name}')
+            print(f'    Booked: {name}')
             perf_ips.append(normalize_to_ip(name))
             booked_items.append(('perf-host', name))
         else:
-            print(f'  No perf-host available for query {perf_query!r}.')
+            print(f'    No perf-host available.')
             raw = input(
-                f'  Enter perf-host {i + 1}/{n_perfhosts} hostname or IP: '
+                f'    Enter perf-host {i + 1}/{n_perfhosts} hostname or IP (or leave empty to skip): '
             ).strip()
-            perf_ips.append(normalize_to_ip(raw))
+            if raw:
+                perf_ips.append(normalize_to_ip(raw))
 
     return brokers, perf_ips
+
+
+def _warn_unowned_resources(
+    names: list[str], resource_type: str, booked_names: set[str],
+) -> bool:
+    """Warn if any of the given resources are not in booked_names.
+
+    For perf-hosts, both hostname (perf-A-B) and IP (192.168.A.B) forms are
+    accepted as evidence of ownership.  Returns True if any unowned resources
+    were found.
+    """
+    unowned = []
+    for name in names:
+        if resource_type == 'perf-host':
+            ip       = normalize_to_ip(name)
+            hostname = ip_to_perf_host(ip)
+            if name not in booked_names and ip not in booked_names and hostname not in booked_names:
+                unowned.append(name)
+        else:
+            if name not in booked_names:
+                unowned.append(name)
+
+    if unowned:
+        label = 'broker' if resource_type in ('vmr', 'appliance') else resource_type
+        display = (
+            [display_perf(normalize_to_ip(n)) for n in unowned]
+            if resource_type == 'perf-host' else unowned
+        )
+        print(f'\n  WARNING: the following {label}(s) do not appear to be booked by you:')
+        for d in display:
+            print(f'    {d}')
+
+    return bool(unowned)
+
+
+# ---------------------------------------------------------------------------
+# Resource type helpers
+# ---------------------------------------------------------------------------
+
+def _bookit_get_attr(resource_type: str, name: str, attr: str) -> str | None:
+    """Return a single bookit attribute value for a resource, or None on error."""
+    try:
+        result = subprocess.run(
+            ['bookit', '--type', resource_type, '--get-attribute', attr, name],
+            capture_output=True, text=True, timeout=10,
+        )
+        if result.returncode == 0:
+            return result.stdout.strip() or None
+    except Exception:
+        pass
+    return None
+
+
+def _resolve_broker_type(name: str) -> str | None:
+    """Determine the bookit resource type for a broker by querying bookit.
+
+    Tries 'vmr' first (checking num_cpus), then 'appliance' (checking platform).
+    Returns 'vmr', 'appliance', or None if the resource is not found in either.
+    """
+    if _bookit_get_attr('vmr', name, 'num_cpus') is not None:
+        return 'vmr'
+    if _bookit_get_attr('appliance', name, 'platform') is not None:
+        return 'appliance'
+    return None
+
+
+def _broker_type_desc(name: str) -> str | None:
+    """Return a short type description for a broker by querying bookit, or None.
+
+    Resolves the resource type against bookit first (no name-pattern assumptions).
+    VMRs return 'N cores, X GiB RAM'; appliances return 'platform [sub_platform]'.
+    """
+    btype = _resolve_broker_type(name)
+    if btype == 'vmr':
+        cpus = _bookit_get_attr('vmr', name, 'num_cpus')
+        ram  = _bookit_get_attr('vmr', name, 'ram')
+        if cpus and ram:
+            return f'{cpus} cores, {ram} GiB RAM'
+    elif btype == 'appliance':
+        platform     = _bookit_get_attr('appliance', name, 'platform')
+        sub_platform = _bookit_get_attr('appliance', name, 'sub_platform')
+        if platform:
+            return f'{platform} {sub_platform}'.strip() if sub_platform else platform
+    return None
+
+
+def _perf_host_type_desc(name_or_ip: str) -> str | None:
+    """Return 'OS OS_version' for a perf host from bookit, or None if unavailable."""
+    hostname = ip_to_perf_host(normalize_to_ip(name_or_ip))
+    os_val = _bookit_get_attr('perf-host', hostname, 'OS')
+    os_ver = _bookit_get_attr('perf-host', hostname, 'OS_version')
+    parts = [p for p in (os_val, os_ver) if p]
+    return ' '.join(parts) if parts else None
+
+
+def _broker_booking_query(type_desc: str | None, broker_type: str) -> str:
+    """Build a bookit broker query from a type description string, or return '*'."""
+    if not type_desc:
+        return '*'
+    if broker_type == 'vmr':
+        m = re.match(r'(\d+)\s+cores,\s+([\d.]+)\s+GiB', type_desc)
+        return f'num_cpus:{m.group(1)} ram:{m.group(2)}' if m else '*'
+    # Appliance: description is 'platform [sub_platform]'
+    parts = type_desc.split(None, 1)
+    if len(parts) == 2:
+        return f'platform:{parts[0]} sub_platform:{parts[1]}'
+    if len(parts) == 1:
+        return f'platform:{parts[0]}'
+    return '*'
+
+
+def _perf_booking_query(type_desc: str | None) -> str:
+    """Build a bookit perf-host query from a type description string, or return '*'."""
+    if not type_desc:
+        return '*'
+    parts = type_desc.split()
+    if len(parts) >= 2:
+        return f'OS:{parts[0]} OS_version:{parts[1]}'
+    if len(parts) == 1:
+        return f'OS:{parts[0]}'
+    return '*'
+
+
+def _type_desc_from_attrs(rtype: str, attrs: dict) -> str | None:
+    """Extract a short type description from a bookit status-json attrs dict.
+
+    The attrs dict is expected to map attribute names to dicts with a 'value'
+    key (the format used in bookit's --status-json output).  Returns None if
+    the relevant attributes are absent.
+    """
+    if not attrs:
+        return None
+
+    def _val(key: str) -> str:
+        entry = attrs.get(key)
+        if isinstance(entry, dict):
+            return entry.get('value', '') or ''
+        return str(entry) if entry else ''
+
+    rtype_lower = rtype.lower()
+    if rtype_lower == 'vmr':
+        cpus = _val('num_cpus')
+        ram  = _val('ram')
+        if cpus and ram:
+            return f'{cpus} cores, {ram} GiB RAM'
+    elif rtype_lower == 'appliance':
+        platform     = _val('platform')
+        sub_platform = _val('sub_platform')
+        if platform:
+            return f'{platform} {sub_platform}'.strip() if sub_platform else platform
+    elif rtype_lower in ('perfhost', 'perf-host'):
+        os_val = _val('OS')
+        os_ver = _val('OS_version')
+        parts = [p for p in (os_val, os_ver) if p]
+        return ' '.join(parts) if parts else None
+    return None
+
+
+def _resource_type_desc(r: dict) -> str | None:
+    """Return a type description for a resource dict from _bookit_current().
+
+    Uses attrs embedded in the status-json resource entry; no extra bookit
+    calls are made.
+    """
+    return _type_desc_from_attrs(r.get('type', ''), r.get('attrs', {}))
 
 
 def free_resources(booked_items: list[tuple[str, str]]) -> None:
@@ -594,6 +793,7 @@ def prompt_book_resources(
     run: dict,
     child_id: str,
     booked_items: list[tuple[str, str]],
+    orig_perf_types: list[str],
 ) -> tuple[list[str], list[str], list[str]] | None:
     """Offer to auto-book resources.
 
@@ -601,6 +801,35 @@ def prompt_book_resources(
     caller can free partial results on interruption.  Returns
     (brokers, monitor, perf_ips) or None if the user declines.
     """
+    # Show resources already owned by the user so they can make an informed choice.
+    # Brokers (VMR, Appliance, COTS) sort first, then other types; within each type by name.
+    _BROKER_TYPES = {'VMR', 'Appliance', 'COTS'}
+
+    def _resource_sort_key(r: dict) -> tuple:
+        rtype = r.get('type', '')
+        return (0 if rtype in _BROKER_TYPES else 1, rtype, r.get('name', ''))
+
+    try:
+        current = _bookit_current()
+        if current:
+            print('\n  Your current bookit resources:')
+            for r in sorted(current, key=_resource_sort_key):
+                end   = r.get('end', '?')
+                rtype = r.get('type', '')
+                name  = r['name']
+                # Show perf hosts as "IP (hostname)" to match the original resources format
+                if rtype.lower() in ('perfhost', 'perf-host') and _PERF_HOST_RE.match(name):
+                    display_name = display_perf(perf_host_to_ip(name))
+                else:
+                    display_name = name
+                desc   = _resource_type_desc(r)
+                detail = f' - {desc.replace(chr(10), " ").strip()}' if desc else ''
+                print(f'    {display_name}{detail} [{end}]')
+        else:
+            print('\n  You have no resources currently booked in bookit.')
+    except Exception:
+        print('\n  (Could not fetch current bookit resources.)')
+
     answer = input('\nAuto-book resources via bookit? [y/N] ').strip().lower()
     if answer != 'y':
         return None
@@ -608,19 +837,46 @@ def prompt_book_resources(
     n_brokers = len(sting['brokers'])
     n_perf = len(run['phosts'])
 
-    raw = input(f'  Booking duration in hours [4]: ').strip()
+    raw = input('  Booking duration in hours [4]: ').strip()
     duration = float(raw) if raw else 4.0
 
-    raw = input(f'  VMR query [{n_brokers} needed, default "*"]: ').strip()
-    vmr_query = raw or '*'
+    raw = input('  Booking message ["afw troubleshooting"]: ').strip()
+    booking_message = raw or 'afw troubleshooting'
 
-    raw = input(f'  Perf-host query [{n_perf} needed, default "*"]: ').strip()
-    perf_query = raw or '*'
+    # Look up original resource types per broker to suggest matching booking queries.
+    print('  Looking up original resource types ...')
+    orig_broker_types = [_broker_type_desc(b) for b in sting['brokers']]
+    orig_perf_type_list = [
+        (orig_perf_types[i] if i < len(orig_perf_types)
+         else _perf_host_type_desc(run['phosts'][i]))
+        for i in range(len(run['phosts']))
+    ]
+
+    for b, t in zip(sting['brokers'], orig_broker_types):
+        print(f'  Original broker type   : {b} -> {t or "(unknown)"}')
+    for ip, t in zip(run['phosts'], orig_perf_type_list):
+        print(f'  Original perf-host type: {display_perf(ip)} -> {t or "(unknown)"}')
+
+    # Use the first resolved type to build the default booking query.
+    first_orig_broker = sting['brokers'][0] if sting['brokers'] else None
+    broker_type       = (_resolve_broker_type(first_orig_broker) or 'vmr') if first_orig_broker else 'vmr'
+    first_broker_type = orig_broker_types[0] if orig_broker_types else None
+    orig_perf_type    = orig_perf_type_list[0] if orig_perf_type_list else None
+
+    default_broker_q = _broker_booking_query(first_broker_type, broker_type)
+    default_perf_q   = _perf_booking_query(orig_perf_type)
+
+    raw = input(f'  Broker query [{n_brokers} needed, default "{default_broker_q}"]: ').strip()
+    broker_query = raw or default_broker_q
+
+    raw = input(f'  Perf-host query [{n_perf} needed, default "{default_perf_q}"]: ').strip()
+    perf_query = raw or default_perf_q
 
     run_tag = f'rerun-afw-{child_id}'
     print()
     brokers, perf_ips = book_resources(
-        n_brokers, n_perf, vmr_query, perf_query, duration, run_tag, booked_items,
+        n_brokers, n_perf, broker_query, perf_query, duration, run_tag, booked_items,
+        broker_type=broker_type, booking_message=booking_message,
     )
 
     print(f'\n  Booked brokers   : {", ".join(brokers)}')
@@ -655,7 +911,7 @@ def main() -> None:
     args = ap.parse_args()
 
     print(f'Fetching {args.url} ...')
-    sting_raw, run_raw, load_version = fetch_commands(args.url)
+    sting_raw, run_raw, load_version, orig_perf_types = fetch_commands(args.url)
 
     sting = None
     if sting_raw is not None:
@@ -671,14 +927,20 @@ def main() -> None:
 
     print('\n--- Original resources ---')
     v_str = _version_display(load_version) if load_version else '(not found)'
-    if sting:
-        print(f'  Brokers    : {", ".join(sting["brokers"])}')
-        print(f'  Monitoring : {", ".join(sting["monitor"]) or "(none)"}')
-        print(f'  Version    : {v_str}')
-    else:
-        print(f'  Brokers    : {", ".join(run["hosts"])}')
-        print(f'  Version    : {v_str}')
-    print(f'  Perf hosts : {", ".join(display_perf(ip) for ip in run["phosts"])}')
+    orig_broker_list = sting['brokers'] if sting else run['hosts']
+    monitor_set = set(sting['monitor']) if sting else set()
+    print('  Brokers (looking up types):')
+    for b in orig_broker_list:
+        desc   = _broker_type_desc(b)
+        detail = f' - {desc}' if desc else ''
+        tag    = ' [monitoring]' if b in monitor_set else ''
+        print(f'    {b}{detail}{tag}')
+    print(f'  Version    : {v_str}')
+    print('  Perf hosts:')
+    for i, ip in enumerate(run['phosts']):
+        disp   = display_perf(ip)
+        detail = f' - {orig_perf_types[i]}' if i < len(orig_perf_types) else ''
+        print(f'    {disp}{detail}')
 
     booked_items: list[tuple[str, str]] = []
 
@@ -693,7 +955,7 @@ def main() -> None:
         orig_brokers = sting['brokers'] if sting else run['hosts']
         orig_monitor = sting['monitor'] if sting else []
 
-        booked = prompt_book_resources(sting, run, child_id, booked_items) if sting else None
+        booked = prompt_book_resources(sting, run, child_id, booked_items, orig_perf_types) if sting else None
         if booked is not None:
             new_brokers, new_monitor, new_phosts = booked
         else:
@@ -781,12 +1043,64 @@ def main() -> None:
         print(f'  Brokers    : {", ".join(new_brokers)}')
         if sting:
             print(f'  Monitoring : {", ".join(new_monitor) or "(none)"}')
-            print(f'  Version    : {version}')
+            print(f'  Version    : {_strip_soltr(version)}')
         print(f'  Perf hosts : {", ".join(display_perf(ip) for ip in new_phosts)}')
         lib_val = str(scripts_dir) if scripts_dir is not None else '(not set)'
         run_dir = str(scripts_dir / 'scripts') if scripts_dir is not None else '(not set)'
         print(f'  SOL_AFW_CURRENT_LIB={lib_val}')
         print(f'  Run directory      : {run_dir}')
+
+        try:
+            booked_names: set[str] = {r['name'] for r in _bookit_current()}
+        except Exception:
+            print('\n  WARNING: bookit unavailable; resource ownership could not be verified.')
+            booked_names = None
+
+        if booked_names is not None:
+            detected_broker_type = (_resolve_broker_type(new_brokers[0]) or 'vmr') if new_brokers else 'vmr'
+            broker_warn = _warn_unowned_resources(new_brokers, detected_broker_type, booked_names)
+            perf_warn   = _warn_unowned_resources(new_phosts, 'perf-host', booked_names)
+        if booked_names is not None and (broker_warn or perf_warn):
+            if input('\nContinue with unowned resources? [y/N] ').strip().lower() != 'y':
+                _offer_free()
+                return
+
+        # Check resource type compatibility per position against the original test.
+        type_warnings: list[str] = []
+        for i, broker in enumerate(new_brokers):
+            orig = orig_brokers[i] if i < len(orig_brokers) else None
+            if orig is None:
+                continue
+            orig_t = _broker_type_desc(orig)
+            new_t  = _broker_type_desc(broker)
+            if orig_t and new_t and orig_t != new_t:
+                type_warnings.append(
+                    f'  Broker {broker}: {new_t} (original {orig}: {orig_t})'
+                )
+        for i, ip in enumerate(new_phosts):
+            if i < len(orig_perf_types):
+                orig_t = orig_perf_types[i]
+            elif i < len(run['phosts']):
+                orig_t = _perf_host_type_desc(run['phosts'][i])
+            else:
+                orig_t = None
+            if orig_t is None:
+                continue
+            new_t = _perf_host_type_desc(ip)
+            if new_t and new_t != orig_t:
+                orig_display = (display_perf(run['phosts'][i])
+                                if i < len(run['phosts']) else '?')
+                type_warnings.append(
+                    f'  Perf host {display_perf(ip)}: {new_t}'
+                    f' (original {orig_display}: {orig_t})'
+                )
+        if type_warnings:
+            print('\n  WARNING: resource type mismatch with original test:')
+            for w in type_warnings:
+                print(w)
+            if input('\nContinue with mismatched resource types? [y/N] ').strip().lower() != 'y':
+                _offer_free()
+                return
 
         print('\n--- New commands ---')
         if new_sting:
