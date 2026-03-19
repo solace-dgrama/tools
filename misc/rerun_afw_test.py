@@ -22,6 +22,7 @@ import html
 import json
 import re
 import shlex
+import shutil
 import subprocess
 import sys
 import urllib.request
@@ -208,7 +209,7 @@ def fetch_commands(url: str) -> tuple[str | None, str, str | None, list[str]]:
     run_cmd = extract('Test Script Command Line') or extract('Command Line')
 
     if not sting_cmd:
-        print('WARNING: "Setup" field not found on the page; sting-vmr will be skipped.')
+        print('WARNING: "Setup" field not found on the page.')
     if not run_cmd:
         sys.exit('ERROR: runAutomation command not found on the page')
 
@@ -339,7 +340,7 @@ def build_sting_vmr(
             new_opts.append(tok)
             i += 1
 
-    parts = parsed['pre'] + new_brokers + [version] + new_opts
+    parts = parsed['pre'] + new_brokers + [_strip_soltr(version)] + new_opts
     return ' '.join(shlex.quote(t) for t in parts)
 
 
@@ -476,6 +477,176 @@ def prompt_perf_hosts(original_ips: list[str]) -> list[str]:
             print(f'  ERROR: duplicates: {", ".join(display_perf(d) for d in dups)}. Please try again.')
             continue
         return items
+
+
+# ---------------------------------------------------------------------------
+# Sting-vmr from scratch
+# ---------------------------------------------------------------------------
+
+_DEFAULT_STING_OPTS = (
+    '--vmr-type enterprise --scaling-max-connections auto '
+    '--scaling-max-queue-messages auto --docker-os redhat '
+    '--docker-config vmr_docker_prod1 --docker-user 1000001 '
+    '--docker-network host --use-environment-variables'
+)
+
+
+def _find_afw_tools() -> 'str | None':
+    found = shutil.which('afw-tools')
+    if found:
+        return found
+    fallback = '/home/automation/bin/afw-tools'
+    if Path(fallback).exists():
+        return fallback
+    return None
+
+
+def _get_sting_vmr_help() -> str:
+    sting_vmr = shutil.which('sting-vmr') or '/home/automation/bin/sting-vmr'
+    try:
+        result = subprocess.run(
+            [sting_vmr, '-h'],
+            capture_output=True, text=True, timeout=15,
+        )
+        return (result.stdout + result.stderr).strip()
+    except Exception:
+        return ''
+
+
+def _parse_known_flags(help_text: str) -> 'set[str]':
+    return set(re.findall(r'--[\w-]+', help_text))
+
+
+def _sanitize_sting_opts(opts_tokens: list, known_flags: set) -> list:
+    """Return list of unknown --flag names found in opts_tokens."""
+    unknown = []
+    for token in opts_tokens:
+        if token.startswith('--') and token not in known_flags:
+            unknown.append(token)
+    if unknown:
+        print(f'  WARNING: unrecognised flags: {", ".join(unknown)}')
+    return unknown
+
+
+def _assemble_sting_from_scratch(
+    afw_tools: str, brokers: list, monitor: list, version: str, opts_tokens: list,
+) -> str:
+    parts = [afw_tools, 'sting-vmr'] + brokers + [_strip_soltr(version)]
+    if monitor:
+        parts += ['--monitoring-nodes', ','.join(monitor)]
+    parts += opts_tokens
+    return ' '.join(shlex.quote(t) for t in parts)
+
+
+def _prompt_version(load_version: 'str | None') -> str:
+    """Prompt for a broker load version with fuzzy matching. Returns the chosen version (may be empty)."""
+    if not load_version:
+        print('  WARNING: "Load" field not found on the page.')
+    hint_v = _strip_soltr(load_version) if load_version else ''
+    hint = f' [{hint_v}]' if hint_v else ''
+    while True:
+        raw = input(f'\n  Broker load version{hint}: ').strip()
+        version = raw if raw else load_version or ''
+        if not version:
+            return version
+
+        lpath = _load_path(version)
+        if lpath is not None and lpath.is_dir():
+            return version
+
+        candidates = _find_load_candidates(version)
+        if not candidates:
+            print(f'  ERROR: {_strip_soltr(version)!r} not found. Please try again.')
+            hint = f' [{_strip_soltr(version)}]'
+            continue
+
+        if len(candidates) == 1:
+            ans = input(f'  Use {candidates[0]}? [Y/n] ').strip().lower()
+            if ans != 'n':
+                return candidates[0]
+            hint = f' [{_strip_soltr(version)}]'
+            continue
+
+        print('  Matching loads:')
+        for i, c in enumerate(candidates, 1):
+            print(f'    [{i}] {c}')
+        while True:
+            sel = input(f'  Select [1-{len(candidates)}] or Enter to retry: ').strip()
+            if not sel:
+                hint = f' [{_strip_soltr(version)}]'
+                break
+            if sel.isdigit() and 1 <= int(sel) <= len(candidates):
+                return candidates[int(sel) - 1]
+            print(f'  Enter a number between 1 and {len(candidates)}.')
+
+
+def prompt_sting_from_scratch(new_brokers: list) -> 'tuple | None':
+    """Interactively build a sting-vmr invocation from scratch.
+
+    Returns (sting_brokers, monitor_nodes, opts_tokens, afw_tools_path) or
+    None if user declines.
+    """
+    ans = input('\nNo sting-vmr command in the original run. Build one now? [y/N] ').strip().lower()
+    if ans != 'y':
+        return None
+
+    afw_tools = _find_afw_tools()
+    if afw_tools is None:
+        raw = input(
+            '  afw-tools not found. Path [/home/automation/bin/afw-tools]: '
+        ).strip()
+        afw_tools = raw if raw else '/home/automation/bin/afw-tools'
+        if not Path(afw_tools).exists():
+            print(f'  WARNING: {afw_tools!r} does not exist.')
+
+    broker_str = ', '.join(new_brokers)
+    raw = input(f'\n  Brokers to sting ({broker_str}) : ').strip()
+    sting_brokers = [h for h in re.split(r'[,\s]+', raw) if h] if raw else list(new_brokers)
+
+    sting_set = set(sting_brokers)
+    while True:
+        raw = input('  Monitoring node(s) (space or comma separated): ').strip()
+        monitor = [h for h in re.split(r'[,\s]+', raw) if h]
+        dups = _duplicates(monitor)
+        if dups:
+            print(f'  ERROR: duplicates: {", ".join(dups)}. Please try again.')
+            continue
+        outside = [n for n in monitor if n not in sting_set]
+        if outside:
+            print(f'  ERROR: not in broker list: {", ".join(outside)}. Please try again.')
+            continue
+        break
+
+    show_help = input("\n  Show 'sting-vmr -h' output? [y/N] ").strip().lower()
+    if show_help == 'y':
+        help_text = _get_sting_vmr_help()
+        if help_text:
+            print(help_text)
+        else:
+            print('  (Help unavailable. Run: sting-vmr -h)')
+    else:
+        help_text = None
+
+    print(f'\n  Default options: {_DEFAULT_STING_OPTS}')
+
+    while True:
+        raw = input('  Options (Enter to accept defaults): ').strip()
+        opts_tokens = shlex.split(raw) if raw else shlex.split(_DEFAULT_STING_OPTS)
+
+        if help_text is None:
+            help_text = _get_sting_vmr_help()
+        known_flags = _parse_known_flags(help_text) if help_text else set()
+
+        if known_flags:
+            unknown = _sanitize_sting_opts(opts_tokens, known_flags)
+            if unknown:
+                keep = input('  Keep unknown options? [y/N] ').strip().lower()
+                if keep != 'y':
+                    continue
+
+        break
+
+    return sting_brokers, monitor, opts_tokens, afw_tools
 
 
 # ---------------------------------------------------------------------------
@@ -965,6 +1136,14 @@ def main() -> None:
             new_monitor = prompt_monitor(new_brokers, orig_monitor) if sting else []
             new_phosts  = prompt_perf_hosts(run['phosts'])
 
+        built_sting_opts: list | None = None
+        afw_tools_for_sting: str | None = None
+        built_sting_brokers: list | None = None
+        if sting is None:
+            result = prompt_sting_from_scratch(new_brokers)
+            if result is not None:
+                built_sting_brokers, new_monitor, built_sting_opts, afw_tools_for_sting = result
+
         warnings = []
         if len(new_brokers) != len(orig_brokers):
             warnings.append(f'brokers: {len(new_brokers)}/{len(orig_brokers)}')
@@ -984,52 +1163,24 @@ def main() -> None:
         new_perf_host_ip = new_phosts[0] if new_phosts else ''
 
         if sting:
-            if not load_version:
-                print('  WARNING: "Load" field not found on the page.')
-            hint_v = _strip_soltr(load_version) if load_version else ''
-            hint = f' [{hint_v}]' if hint_v else ''
-            while True:
-                raw = input(f'\n  Broker load version{hint}: ').strip()
-                version = raw if raw else load_version or ''
-                if not version:
-                    break
-
-                # Exact match?
-                lpath = _load_path(version)
-                if lpath is not None and lpath.is_dir():
-                    break
-
-                # Try partial/fuzzy match
-                candidates = _find_load_candidates(version)
-                if not candidates:
-                    print(f'  ERROR: {_strip_soltr(version)!r} not found. Please try again.')
-                    hint = f' [{_strip_soltr(version)}]'
-                    continue
-
-                if len(candidates) == 1:
-                    ans = input(f'  Use {candidates[0]}? [Y/n] ').strip().lower()
-                    if ans != 'n':
-                        version = candidates[0]
-                        break
-                    hint = f' [{_strip_soltr(version)}]'
-                    continue
-
-                # Multiple candidates — let the user pick
-                print('  Matching loads:')
-                for i, c in enumerate(candidates, 1):
-                    print(f'    [{i}] {c}')
-                while True:
-                    sel = input(f'  Select [1-{len(candidates)}] or Enter to retry: ').strip()
-                    if not sel:
-                        hint = f' [{_strip_soltr(version)}]'
-                        break
-                    if sel.isdigit() and 1 <= int(sel) <= len(candidates):
-                        version = candidates[int(sel) - 1]
-                        break
-                    print(f'  Enter a number between 1 and {len(candidates)}.')
-                if any(version == c for c in candidates):
-                    break
+            version = _prompt_version(load_version)
             new_sting = build_sting_vmr(sting, new_brokers, new_monitor, version)
+        elif built_sting_opts is not None:
+            while True:
+                version = _prompt_version(load_version)
+                new_sting = _assemble_sting_from_scratch(
+                    afw_tools_for_sting, built_sting_brokers, new_monitor, version, built_sting_opts,
+                )
+                print(f'\n  sting-vmr command:\n    {new_sting}')
+                if input('  Happy with this command? [Y/n] ').strip().lower() != 'n':
+                    break
+                result = prompt_sting_from_scratch(new_brokers)
+                if result is None:
+                    built_sting_opts = None
+                    version = None
+                    new_sting = None
+                    break
+                built_sting_brokers, new_monitor, built_sting_opts, afw_tools_for_sting = result
         else:
             version = None
             new_sting = None
@@ -1042,7 +1193,7 @@ def main() -> None:
 
         print('\n--- New resources ---')
         print(f'  Brokers    : {", ".join(new_brokers)}')
-        if sting:
+        if sting or built_sting_opts is not None:
             print(f'  Monitoring : {", ".join(new_monitor) or "(none)"}')
             print(f'  Version    : {_strip_soltr(version)}')
         print(f'  Perf hosts : {", ".join(display_perf(ip) for ip in new_phosts)}')
