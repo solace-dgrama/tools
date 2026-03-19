@@ -789,7 +789,7 @@ def free_resources(booked_items: list[tuple[str, str]]) -> None:
 
 
 def prompt_book_resources(
-    sting: dict,
+    sting: dict | None,
     run: dict,
     child_id: str,
     booked_items: list[tuple[str, str]],
@@ -834,7 +834,8 @@ def prompt_book_resources(
     if answer != 'y':
         return None
 
-    n_brokers = len(sting['brokers'])
+    orig_brokers = sting['brokers'] if sting else run['hosts']
+    n_brokers = len(orig_brokers)
     n_perf = len(run['phosts'])
 
     raw = input('  Booking duration in hours [4]: ').strip()
@@ -845,20 +846,20 @@ def prompt_book_resources(
 
     # Look up original resource types per broker to suggest matching booking queries.
     print('  Looking up original resource types ...')
-    orig_broker_types = [_broker_type_desc(b) for b in sting['brokers']]
+    orig_broker_types = [_broker_type_desc(b) for b in orig_brokers]
     orig_perf_type_list = [
         (orig_perf_types[i] if i < len(orig_perf_types)
          else _perf_host_type_desc(run['phosts'][i]))
         for i in range(len(run['phosts']))
     ]
 
-    for b, t in zip(sting['brokers'], orig_broker_types):
+    for b, t in zip(orig_brokers, orig_broker_types):
         print(f'  Original broker type   : {b} -> {t or "(unknown)"}')
     for ip, t in zip(run['phosts'], orig_perf_type_list):
         print(f'  Original perf-host type: {display_perf(ip)} -> {t or "(unknown)"}')
 
     # Use the first resolved type to build the default booking query.
-    first_orig_broker = sting['brokers'][0] if sting['brokers'] else None
+    first_orig_broker = orig_brokers[0] if orig_brokers else None
     broker_type       = (_resolve_broker_type(first_orig_broker) or 'vmr') if first_orig_broker else 'vmr'
     first_broker_type = orig_broker_types[0] if orig_broker_types else None
     orig_perf_type    = orig_perf_type_list[0] if orig_perf_type_list else None
@@ -882,7 +883,7 @@ def prompt_book_resources(
     print(f'\n  Booked brokers   : {", ".join(brokers)}')
     print(f'  Booked perf hosts: {", ".join(display_perf(ip) for ip in perf_ips)}')
 
-    monitor = prompt_monitor(brokers, sting['monitor'])
+    monitor = prompt_monitor(brokers, sting['monitor']) if sting else []
     return brokers, monitor, perf_ips
 
 
@@ -955,7 +956,7 @@ def main() -> None:
         orig_brokers = sting['brokers'] if sting else run['hosts']
         orig_monitor = sting['monitor'] if sting else []
 
-        booked = prompt_book_resources(sting, run, child_id, booked_items, orig_perf_types) if sting else None
+        booked = prompt_book_resources(sting, run, child_id, booked_items, orig_perf_types)
         if booked is not None:
             new_brokers, new_monitor, new_phosts = booked
         else:
