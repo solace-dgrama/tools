@@ -538,6 +538,56 @@ def _assemble_sting_from_scratch(
     return ' '.join(shlex.quote(t) for t in parts)
 
 
+def prompt_review_sting(initial_cmd: str) -> str:
+    """Present a sting-vmr command for review and optional interactive modification.
+
+    Shows the command, asks if the user wants to modify it, then enters a
+    feedback loop: optionally show help → user types new command text →
+    sanitize against known flags → accept or loop again.
+
+    Returns the accepted command string.
+    """
+    cmd = initial_cmd
+    print(f'\n  sting-vmr command:\n    {cmd}')
+    if input('  Modify this command? [y/N] ').strip().lower() != 'y':
+        return cmd
+
+    help_text: 'str | None' = None
+
+    while True:
+        if input("  Show 'afw-tools sting-vmr --help'? [y/N] ").strip().lower() == 'y':
+            if help_text is None:
+                help_text = _get_sting_vmr_help()
+            if help_text:
+                print(help_text)
+            else:
+                print('  (Help unavailable. Run: afw-tools sting-vmr --help)')
+
+        print(f'\n  Current command:\n    {cmd}')
+        raw = input('  New command (Enter to keep): ').strip()
+        if raw:
+            cmd = raw
+
+        try:
+            tokens = shlex.split(cmd)
+        except ValueError as exc:
+            print(f'  ERROR: could not parse command: {exc}. Please try again.')
+            continue
+
+        if help_text is None:
+            help_text = _get_sting_vmr_help()
+        known_flags = _parse_known_flags(help_text) if help_text else set()
+
+        if known_flags:
+            unknown = _sanitize_sting_opts(tokens, known_flags)
+            if unknown and input('  Keep unknown flags? [y/N] ').strip().lower() != 'y':
+                continue
+
+        print(f'\n  sting-vmr command:\n    {cmd}')
+        if input('  Accept this command? [Y/n] ').strip().lower() != 'n':
+            return cmd
+
+
 def _prompt_version(load_version: 'str | None') -> str:
     """Prompt for a broker load version with fuzzy matching. Returns the chosen version (may be empty)."""
     if not load_version:
@@ -581,10 +631,11 @@ def _prompt_version(load_version: 'str | None') -> str:
 
 
 def prompt_sting_from_scratch(new_brokers: list) -> 'tuple | None':
-    """Interactively build a sting-vmr invocation from scratch.
+    """Interactively gather resources for a sting-vmr invocation built from scratch.
 
-    Returns (sting_brokers, monitor_nodes, opts_tokens, afw_tools_path) or
-    None if user declines.
+    Returns (sting_brokers, monitor_nodes, afw_tools_path) or None if user declines.
+    The caller is responsible for prompting the version and reviewing/modifying
+    the assembled command via prompt_review_sting.
     """
     ans = input('\nNo sting-vmr command in the original run. Build one now? [y/N] ').strip().lower()
     if ans != 'y':
@@ -617,36 +668,7 @@ def prompt_sting_from_scratch(new_brokers: list) -> 'tuple | None':
             continue
         break
 
-    show_help = input("\n  Show 'afw-tools sting-vmr --help' output? [y/N] ").strip().lower()
-    if show_help == 'y':
-        help_text = _get_sting_vmr_help()
-        if help_text:
-            print(help_text)
-        else:
-            print('  (Help unavailable. Run: afw-tools sting-vmr --help)')
-    else:
-        help_text = None
-
-    print(f'\n  Default options: {_DEFAULT_STING_OPTS}')
-
-    while True:
-        raw = input('  Options (Enter to accept defaults): ').strip()
-        opts_tokens = shlex.split(raw) if raw else shlex.split(_DEFAULT_STING_OPTS)
-
-        if help_text is None:
-            help_text = _get_sting_vmr_help()
-        known_flags = _parse_known_flags(help_text) if help_text else set()
-
-        if known_flags:
-            unknown = _sanitize_sting_opts(opts_tokens, known_flags)
-            if unknown:
-                keep = input('  Keep unknown options? [y/N] ').strip().lower()
-                if keep != 'y':
-                    continue
-
-        break
-
-    return sting_brokers, monitor, opts_tokens, afw_tools
+    return sting_brokers, monitor, afw_tools
 
 
 # ---------------------------------------------------------------------------
@@ -1136,13 +1158,12 @@ def main() -> None:
             new_monitor = prompt_monitor(new_brokers, orig_monitor) if sting else []
             new_phosts  = prompt_perf_hosts(run['phosts'])
 
-        built_sting_opts: list | None = None
         afw_tools_for_sting: str | None = None
         built_sting_brokers: list | None = None
         if sting is None:
             result = prompt_sting_from_scratch(new_brokers)
             if result is not None:
-                built_sting_brokers, new_monitor, built_sting_opts, afw_tools_for_sting = result
+                built_sting_brokers, new_monitor, afw_tools_for_sting = result
 
         warnings = []
         if len(new_brokers) != len(orig_brokers):
@@ -1164,23 +1185,14 @@ def main() -> None:
 
         if sting:
             version = _prompt_version(load_version)
-            new_sting = build_sting_vmr(sting, new_brokers, new_monitor, version)
-        elif built_sting_opts is not None:
-            while True:
-                version = _prompt_version(load_version)
-                new_sting = _assemble_sting_from_scratch(
-                    afw_tools_for_sting, built_sting_brokers, new_monitor, version, built_sting_opts,
-                )
-                print(f'\n  sting-vmr command:\n    {new_sting}')
-                if input('  Happy with this command? [Y/n] ').strip().lower() != 'n':
-                    break
-                result = prompt_sting_from_scratch(new_brokers)
-                if result is None:
-                    built_sting_opts = None
-                    version = None
-                    new_sting = None
-                    break
-                built_sting_brokers, new_monitor, built_sting_opts, afw_tools_for_sting = result
+            new_sting = prompt_review_sting(build_sting_vmr(sting, new_brokers, new_monitor, version))
+        elif built_sting_brokers is not None:
+            version = _prompt_version(load_version)
+            initial_cmd = _assemble_sting_from_scratch(
+                afw_tools_for_sting, built_sting_brokers, new_monitor, version,
+                shlex.split(_DEFAULT_STING_OPTS),
+            )
+            new_sting = prompt_review_sting(initial_cmd)
         else:
             version = None
             new_sting = None
@@ -1193,7 +1205,7 @@ def main() -> None:
 
         print('\n--- New resources ---')
         print(f'  Brokers    : {", ".join(new_brokers)}')
-        if sting or built_sting_opts is not None:
+        if new_sting:
             print(f'  Monitoring : {", ".join(new_monitor) or "(none)"}')
             print(f'  Version    : {_strip_soltr(version)}')
         print(f'  Perf hosts : {", ".join(display_perf(ip) for ip in new_phosts)}')
