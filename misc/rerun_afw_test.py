@@ -502,10 +502,10 @@ def _find_afw_tools() -> 'str | None':
 
 
 def _get_sting_vmr_help() -> str:
-    sting_vmr = shutil.which('sting-vmr') or '/home/automation/bin/sting-vmr'
+    afw_tools = shutil.which('afw-tools') or '/home/automation/bin/afw-tools'
     try:
         result = subprocess.run(
-            [sting_vmr, '-h'],
+            [afw_tools, 'sting-vmr', '--help'],
             capture_output=True, text=True, timeout=15,
         )
         return (result.stdout + result.stderr).strip()
@@ -617,13 +617,13 @@ def prompt_sting_from_scratch(new_brokers: list) -> 'tuple | None':
             continue
         break
 
-    show_help = input("\n  Show 'sting-vmr -h' output? [y/N] ").strip().lower()
+    show_help = input("\n  Show 'afw-tools sting-vmr --help' output? [y/N] ").strip().lower()
     if show_help == 'y':
         help_text = _get_sting_vmr_help()
         if help_text:
             print(help_text)
         else:
-            print('  (Help unavailable. Run: sting-vmr -h)')
+            print('  (Help unavailable. Run: afw-tools sting-vmr --help)')
     else:
         help_text = None
 
