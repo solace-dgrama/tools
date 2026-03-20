@@ -528,6 +528,18 @@ def _sanitize_sting_opts(opts_tokens: list, known_flags: set) -> list:
     return unknown
 
 
+def _validate_sting_cmd(cmd: str) -> 'tuple[bool, str]':
+    """Structurally validate a sting-vmr command string.
+
+    Returns (ok, error_message). error_message is empty when ok is True.
+    """
+    try:
+        parse_sting_vmr(cmd)
+        return True, ''
+    except ValueError as exc:
+        return False, str(exc)
+
+
 def _assemble_sting_from_scratch(
     afw_tools: str, brokers: list, monitor: list, version: str, opts_tokens: list,
 ) -> str:
@@ -541,15 +553,26 @@ def _assemble_sting_from_scratch(
 def prompt_review_sting(initial_cmd: str) -> str:
     """Present a sting-vmr command for review and optional interactive modification.
 
-    Shows the command, asks if the user wants to modify it, then enters a
-    feedback loop: optionally show help → user types new command text →
-    sanitize against known flags → accept or loop again.
+    Validates the command structure, shows it, asks if the user wants to modify
+    it, then enters a feedback loop: optionally show help → user types new
+    command text → validate structure → sanitize against known flags → accept
+    or loop again.
 
     Returns the accepted command string.
     """
     cmd = initial_cmd
+    ok, err = _validate_sting_cmd(cmd)
+    if not ok:
+        print(f'  WARNING: sting command validation failed: {err}')
     print(f'\n  sting-vmr command:\n    {cmd}')
-    if input('  Modify this command? [y/N] ').strip().lower() != 'y':
+
+    if not ok:
+        ans = input('  Command appears invalid. Modify? [Y/n] ').strip().lower()
+        enter_loop = ans != 'n'
+    else:
+        enter_loop = input('  Modify this command? [y/N] ').strip().lower() == 'y'
+
+    if not enter_loop:
         return cmd
 
     help_text: 'str | None' = None
@@ -573,6 +596,12 @@ def prompt_review_sting(initial_cmd: str) -> str:
         except ValueError as exc:
             print(f'  ERROR: could not parse command: {exc}. Please try again.')
             continue
+
+        ok, err = _validate_sting_cmd(cmd)
+        if not ok:
+            print(f'  WARNING: sting command validation failed: {err}')
+            if input('  Continue with this command anyway? [y/N] ').strip().lower() != 'y':
+                continue
 
         if help_text is None:
             help_text = _get_sting_vmr_help()
