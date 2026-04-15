@@ -37,8 +37,8 @@ Examples:
 import re
 import sys
 import subprocess
-from typing import List, Tuple, Dict, Optional
-from datetime import datetime
+import xml.etree.ElementTree as ET
+from typing import Any, Dict, List, Optional, Tuple
 
 
 def print_help():
@@ -56,13 +56,13 @@ def extract_action_lists(log_file: str) -> List[Tuple[str, str, str]]:
     try:
         # Use grep to find "Action list" entries with 2 lines of context after
         result = subprocess.run(
-            ['grep', 'Action list', log_file, '-A', '2'],
+            ["grep", "Action list", log_file, "-A", "2"],
             capture_output=True,
             text=True,
-            check=True
+            check=True,
         )
 
-        lines = result.stdout.strip().split('\n')
+        lines = result.stdout.strip().split("\n")
         action_lists = []
 
         i = 0
@@ -70,19 +70,19 @@ def extract_action_lists(log_file: str) -> List[Tuple[str, str, str]]:
             line = lines[i]
 
             # Look for timestamp line with "Action list:"
-            if 'Action list:' in line:
+            if "Action list:" in line:
                 # Extract timestamp [HH:MM:SS]
-                timestamp_match = re.search(r'\[(\d{2}:\d{2}:\d{2})\]', line)
+                timestamp_match = re.search(r"\[(\d{2}:\d{2}:\d{2})\]", line)
                 timestamp = timestamp_match.group(1) if timestamp_match else "Unknown"
 
                 # Skip the "------------" separator line
                 i += 1
-                if i < len(lines) and '------------' in lines[i]:
+                if i < len(lines) and "------------" in lines[i]:
                     i += 1
 
                 # Get the action list content (may span multiple lines until next separator)
                 action_text = ""
-                while i < len(lines) and lines[i] != '--':
+                while i < len(lines) and lines[i] != "--":
                     if lines[i].strip():
                         action_text += lines[i].strip() + " "
                     i += 1
@@ -111,39 +111,44 @@ def extract_executed_actions(log_file: str) -> List[Tuple[str, Dict[str, str]]]:
     try:
         # Grep for "Start of action" lines
         result = subprocess.run(
-            ['grep', '-E', 'Start of action:.*Action -', log_file],
+            ["grep", "-E", "Start of action:.*Action -", log_file],
             capture_output=True,
             text=True,
-            check=True
+            check=True,
         )
 
         executed = []
-        for line in result.stdout.strip().split('\n'):
+        for line in result.stdout.strip().split("\n"):
             # Extract timestamp
-            ts_match = re.search(r'\[(\d{2}:\d{2}:\d{2})\]', line)
+            ts_match = re.search(r"\[(\d{2}:\d{2}:\d{2})\]", line)
             timestamp = ts_match.group(1) if ts_match else "Unknown"
 
             # Parse action details
             # Format: "action: N ~ Current list - X/Y; Action no. - Z; Action - ACTION; target - TARGET; value - VALUE;"
             action_match = re.search(
-                r'action: (\d+) ~ Current list - (\d+)/(\d+); '
-                r'Action no\. - (\d+); '
-                r'Action - ([^;]+); '
-                r'target - ([^;]*); '
-                r'value - ([^;]*);',
-                line
+                r"action: (\d+) ~ Current list - (\d+)/(\d+); "
+                r"Action no\. - (\d+); "
+                r"Action - ([^;]+); "
+                r"target - ([^;]*); "
+                r"value - ([^;]*);",
+                line,
             )
 
             if action_match:
-                executed.append((timestamp, {
-                    'global_num': int(action_match.group(1)),
-                    'list_num': int(action_match.group(2)),
-                    'total_lists': int(action_match.group(3)),
-                    'action_num': int(action_match.group(4)),
-                    'action': action_match.group(5).strip(),
-                    'target': action_match.group(6).strip(),
-                    'value': action_match.group(7).strip()
-                }))
+                executed.append(
+                    (
+                        timestamp,
+                        {
+                            "global_num": int(action_match.group(1)),
+                            "list_num": int(action_match.group(2)),
+                            "total_lists": int(action_match.group(3)),
+                            "action_num": int(action_match.group(4)),
+                            "action": action_match.group(5).strip(),
+                            "target": action_match.group(6).strip(),
+                            "value": action_match.group(7).strip(),
+                        },
+                    )
+                )
 
         return executed
 
@@ -155,141 +160,214 @@ def extract_executed_actions(log_file: str) -> List[Tuple[str, Dict[str, str]]]:
         return []
 
 
-def _parse_keyed_list(line: str) -> Dict[str, any]:
-    """Parse a Tcl keyed list like {rc OK} {txMsgs 240} {txMsgRate 99.17}."""
+def _extract_ts(line: str) -> str:
+    """Extract HH:MM:SS timestamp from a log line."""
+    m = re.search(r"\[(\d{2}:\d{2}:\d{2})\]", line)
+    return m.group(1) if m else "Unknown"
+
+
+def _parse_tcl_kv(line: str) -> Dict:
+    """Parse Tcl-style {key value} pairs from a line into a typed dict."""
     result = {}
-    for key, value in re.findall(r'\{(\w+)\s+([^\}]+)\}', line):
+    for key, val in re.findall(r"\{(\w+)\s+([^}]+)\}", line):
+        val = val.strip()
         try:
-            result[key] = float(value) if '.' in value else int(value)
+            result[key] = int(val)
         except ValueError:
-            result[key] = value
+            try:
+                result[key] = float(val)
+            except ValueError:
+                result[key] = val
     return result
+
+
+def _parse_element_flat(elem: ET.Element) -> Dict[str, Any]:
+    """Return a flat {tag: value} dict for the direct children of an XML element."""
+    result = {}
+    for child in elem:
+        text = (child.text or "").strip()
+        try:
+            result[child.tag] = int(text)
+        except ValueError:
+            result[child.tag] = text
+    return result
+
+
+def _parse_client_spool_stats(xml_lines: List[str]) -> Optional[Dict]:
+    """
+    Parse message-spool-stats from an RPC-REPLY XML captured as a list of lines.
+
+    Returns a dict with keys:
+      ingress_flows: list of flat dicts for each ingress-flow-stat element
+      egress_flows:  list of flat dicts for each egress-flow-stat element
+      qendpt_bind:   flat dict for qendpt-bind-stats
+      pub_open:      flat dict for publisher-open-stats
+    Returns None if the XML cannot be parsed or the expected element is missing.
+    """
+    try:
+        root = ET.fromstring("\n".join(xml_lines))
+    except ET.ParseError:
+        return None
+
+    spool = root.find("./rpc/show/client/client/message-spool-stats")
+    if spool is None:
+        return None
+
+    result: Dict[str, Any] = {}
+
+    ingress = spool.find("ingress-flow-stats")
+    if ingress is not None:
+        result["ingress_flows"] = [
+            _parse_element_flat(f) for f in ingress.findall("ingress-flow-stat")
+        ]
+
+    egress = spool.find("egress-flow-stats")
+    if egress is not None:
+        result["egress_flows"] = [
+            _parse_element_flat(f) for f in egress.findall("egress-flow-stat")
+        ]
+
+    qb = spool.find("qendpt-bind-stats")
+    if qb is not None:
+        result["qendpt_bind"] = _parse_element_flat(qb)
+
+    po = spool.find("publisher-open-stats")
+    if po is not None:
+        result["pub_open"] = _parse_element_flat(po)
+
+    return result
+
+
+# Fields used as sub-header identifiers in flow-stat tables, not data rows.
+_INGRESS_FLOW_IDENTS = frozenset({"flow-name", "flow-id", "publisher-id"})
+_EGRESS_FLOW_IDENTS = frozenset({"flow-id"})
 
 
 def extract_traffic_blocks(log_file: str) -> List[Dict]:
     """
-    Extract traffic validation blocks from the log file.
+    Extract prior/after stat dump pairs from the log file.
 
-    Each block corresponds to one verifyHaStateAndTraffic call, anchored at
-    '=== Debug info before traffic validation ==='.
+    Each pair brackets one ValidateMessageStreamsAtObject call and contains:
+      prior_ts:    timestamp of "Logging stats prior to traffic test."
+      after_ts:    timestamp of "Logging stats after traffic test."
+      pub_clients: {client_name: {'prior': stats, 'after': stats}}
+      sub_clients: {client_name: {'prior': stats, 'after': stats}}
 
-    Stats are always reset just before the block runs, so SDK "after" values
-    are direct deltas (no subtraction needed).  Per-publisher broker
-    guaranteed-messages after the clear equals msgs sent during the interval.
-
-    Returns a list of block dicts containing:
-      anchor_ts, pub_stats_after, sub_stats_after, validation,
-      msg_spool, pub_clients_after, sub_clients_after
+    where stats has keys: ingress_flows, egress_flows, qendpt_bind, pub_open.
     """
-    blocks = []
-    current_block = None
-    section = None
-    cur_pub = None
-    cur_sub = None
+    blocks: List[Dict] = []
+    block: Optional[Dict] = None
+    phase: Optional[str] = None  # 'prior' or 'after'
+    section: Optional[str] = None  # 'pub' or 'sub'
+    awaiting_name = False
+    current_client: Optional[str] = None
+    in_xml = False
+    xml_lines: List[str] = []
 
     try:
-        with open(log_file, 'r') as f:
-            lines = f.readlines()
+        with open(log_file) as f:
+            for raw in f:
+                line = raw.rstrip("\n")
 
-        for line in lines:
-            # New block starts at this marker
-            if 'Debug info before traffic validation' in line:
-                if current_block is not None:
-                    blocks.append(current_block)
-                ts_match = re.search(r'\[(\d{2}:\d{2}:\d{2})\]', line)
-                current_block = {
-                    'anchor_ts': ts_match.group(1) if ts_match else 'Unknown',
-                    'pub_clients_after': {},
-                    'sub_clients_after': {},
-                }
-                section = None
-                cur_pub = None
-                cur_sub = None
-                continue
-
-            if current_block is None:
-                continue
-
-            # Single-line SDK stats (highest priority — check before section routing)
-            if 'Publisher client-side stats after ValidateMessageStreamsAtObject:' in line:
-                current_block['pub_stats_after'] = _parse_keyed_list(line)
-                section = None
-                continue
-            if 'Subscriber client-side stats after ValidateMessageStreamsAtObject:' in line:
-                current_block['sub_stats_after'] = _parse_keyed_list(line)
-                section = None
-                continue
-
-            # Validation result (first occurrence per block)
-            if 'Minimum Expected:' in line and 'validation' not in current_block:
-                m = re.search(r'Minimum Expected:\s+(\d+)\s+\(actual\s+(\d+)\)', line)
-                if m:
-                    exp, act = int(m.group(1)), int(m.group(2))
-                    current_block['validation'] = {
-                        'expected': exp,
-                        'actual': act,
-                        'passed': act >= exp,
+                if "Logging stats prior to traffic test" in line:
+                    if block is not None:
+                        blocks.append(block)
+                    block = {
+                        "prior_ts": _extract_ts(line),
+                        "after_ts": None,
+                        "pub_clients": {},
+                        "sub_clients": {},
+                        "pub_side": {},
+                        "sub_side": {},
                     }
-                continue
+                    phase = "prior"
+                    section = None
+                    awaiting_name = False
+                    current_client = None
+                    in_xml = False
+                    xml_lines = []
+                    continue
 
-            # Section markers
-            if 'Message-spool stats after traffic validation:' in line:
-                section = 'spool'
-                current_block.setdefault('msg_spool', {})
-                continue
-            if 'Publisher client message-spool-stats after traffic validation:' in line:
-                section = 'pub_broker'
-                cur_pub = None
-                continue
-            if 'Subscriber client message-spool-stats after traffic validation:' in line:
-                section = 'sub_broker'
-                cur_sub = None
-                continue
-            if 'Debug info after traffic validation' in line:
-                section = None
-                continue
+                if block is None:
+                    continue
 
-            # Section-specific XML parsing
-            if section == 'spool':
-                for tag, key in [('ingress-messages', 'ingress'),
-                                  ('egress-messages', 'egress'),
-                                  ('total-discarded-messages', 'discards')]:
-                    m = re.search(fr'<{tag}>(\d+)</{tag}>', line)
-                    if m:
-                        current_block['msg_spool'][key] = int(m.group(1))
-                        break
+                if "Logging stats after traffic test" in line:
+                    phase = "after"
+                    section = None
+                    awaiting_name = False
+                    current_client = None
+                    in_xml = False
+                    xml_lines = []
+                    block["after_ts"] = _extract_ts(line)
+                    continue
 
-            elif section == 'pub_broker':
-                m = re.search(r'P2: -name (c_vmrRedundancyRandomActions_pub_\w+)', line)
-                if m:
-                    cur_pub = m.group(1)
-                    current_block['pub_clients_after'].setdefault(cur_pub, {})
-                elif cur_pub:
-                    for tag, key in [('last-message-id-sent', 'last_msg_id'),
-                                     ('guaranteed-messages', 'sent')]:
-                        m = re.search(fr'<{tag}>(\d+)</{tag}>', line)
+                if in_xml:
+                    xml_lines.append(line)
+                    if "</rpc-reply>" in line:
+                        in_xml = False
+                        if current_client and section in ("pub", "sub") and phase:
+                            stats = _parse_client_spool_stats(xml_lines)
+                            if stats is not None:
+                                store = (
+                                    block["pub_clients"]
+                                    if section == "pub"
+                                    else block["sub_clients"]
+                                )
+                                store.setdefault(current_client, {})
+                                store[current_client][phase] = stats
+                        xml_lines = []
+                        current_client = None
+                    continue
+
+                if "[RESULT]" in line:
+                    if "Publisher client message-spool-stats:" in line:
+                        section = "pub"
+                        awaiting_name = False
+                    elif "Subscriber client message-spool-stats:" in line:
+                        section = "sub"
+                        awaiting_name = False
+                    elif "Publisher client-side stats:" in line and phase:
+                        block["pub_side"][phase] = _parse_tcl_kv(line)
+                        section = None
+                        awaiting_name = False
+                    elif "Subscriber client-side stats:" in line and phase:
+                        block["sub_side"][phase] = _parse_tcl_kv(line)
+                        section = None
+                        awaiting_name = False
+                    elif any(
+                        s in line
+                        for s in (
+                            "Global message-spool stats:",
+                            "VPN default message-spool stats:",
+                            "Queue ",
+                        )
+                    ):
+                        section = None
+                        awaiting_name = False
+                    continue
+
+                if section in ("pub", "sub"):
+                    if "::L1::Show::Client] Method params:" in line:
+                        awaiting_name = True
+                        continue
+                    if awaiting_name and "P2: -name" in line:
+                        m = re.search(r"P2: -name (\S+)", line)
                         if m:
-                            current_block['pub_clients_after'][cur_pub][key] = int(m.group(1))
-                            break
-
-            elif section == 'sub_broker':
-                m = re.search(r'P2: -name (c_vmrRedundancyRandomActions_sub_\w+)', line)
-                if m:
-                    cur_sub = m.group(1)
-                    current_block['sub_clients_after'].setdefault(cur_sub, {})
-                elif cur_sub:
-                    m = re.search(
-                        r'<message-confirmed-delivered>(\d+)</message-confirmed-delivered>',
-                        line)
-                    if m:
-                        current_block['sub_clients_after'][cur_sub][
-                            'confirmed_delivered'] = int(m.group(1))
-
-        if current_block is not None:
-            blocks.append(current_block)
+                            current_client = m.group(1)
+                        awaiting_name = False
+                        continue
+                    if current_client and "RPC-REPLY:" in line:
+                        in_xml = True
+                        xml_lines = []
+                        remainder = line[line.index("RPC-REPLY:") + 10 :].strip()
+                        if remainder:
+                            xml_lines.append(remainder)
 
     except FileNotFoundError:
         print(f"Error: Log file '{log_file}' not found", file=sys.stderr)
+
+    if block is not None:
+        blocks.append(block)
 
     return blocks
 
@@ -306,18 +384,14 @@ def parse_actions(action_text: str) -> List[Dict[str, str]]:
     items = action_text.split()
 
     for item in items:
-        parts = item.split(':')
+        parts = item.split(":")
 
         if len(parts) >= 2:
             action_name = parts[0]
             target = parts[1] if len(parts) > 1 else ""
             value = parts[2] if len(parts) > 2 else ""
 
-            actions.append({
-                'action': action_name,
-                'target': target,
-                'value': value
-            })
+            actions.append({"action": action_name, "target": target, "value": value})
 
     return actions
 
@@ -326,19 +400,19 @@ def format_action_list_compact(timestamp: str, actions: List[Dict[str, str]]) ->
     """Format actions in compact list-by-list view."""
 
     output = []
-    output.append(f"\n{'='*80}")
+    output.append(f"\n{'=' * 80}")
     output.append(f"Action List at {timestamp}")
-    output.append(f"{'='*80}\n")
+    output.append(f"{'=' * 80}\n")
 
     list_num = 1
     current_list = []
 
     for idx, action in enumerate(actions):
-        action_name = action['action']
-        target = action['target']
-        value = action['value']
+        action_name = action["action"]
+        target = action["target"]
+        value = action["value"]
 
-        if action_name == 'check':
+        if action_name == "check":
             # Output the current list
             if current_list:
                 output.append(f"List {list_num} → check::{value}")
@@ -350,7 +424,7 @@ def format_action_list_compact(timestamp: str, actions: List[Dict[str, str]]) ->
                 list_num += 1
         else:
             # Build action string
-            if action_name == 'sleep':
+            if action_name == "sleep":
                 act_str = f"sleep {value}s"
             else:
                 target_str = f":{target}" if target else ""
@@ -366,7 +440,7 @@ def format_action_list_compact(timestamp: str, actions: List[Dict[str, str]]) ->
         for i, act_str in enumerate(current_list, 1):
             output.append(f"  {i:2d}. {act_str}")
 
-    return '\n'.join(output)
+    return "\n".join(output)
 
 
 def extract_end_time_entries(log_file: str) -> List[Tuple[str, int]]:
@@ -375,18 +449,18 @@ def extract_end_time_entries(log_file: str) -> List[Tuple[str, int]]:
     """
     try:
         result = subprocess.run(
-            ['grep', '-E', 'End of action:.*Action -', log_file],
+            ["grep", "-E", "End of action:.*Action -", log_file],
             capture_output=True,
             text=True,
-            check=True
+            check=True,
         )
 
         entries = []
-        for line in result.stdout.strip().split('\n'):
-            ts_match = re.search(r'\[(\d{2}:\d{2}:\d{2})\]', line)
+        for line in result.stdout.strip().split("\n"):
+            ts_match = re.search(r"\[(\d{2}:\d{2}:\d{2})\]", line)
             if not ts_match:
                 continue
-            action_match = re.search(r'action: (\d+) ~', line)
+            action_match = re.search(r"action: (\d+) ~", line)
             if action_match:
                 entries.append((ts_match.group(1), int(action_match.group(1))))
 
@@ -400,7 +474,7 @@ def extract_end_time_entries(log_file: str) -> List[Tuple[str, int]]:
 
 
 def split_into_runs(
-        executed: List[Tuple[str, Dict[str, str]]]
+    executed: List[Tuple[str, Dict[str, str]]],
 ) -> List[List[Tuple[str, Dict[str, str]]]]:
     """
     Split flat list of executed action entries into individual test runs.
@@ -415,7 +489,7 @@ def split_into_runs(
     run_max = 0
 
     for entry in executed:
-        global_num = entry[1]['global_num']
+        global_num = entry[1]["global_num"]
         if current_run and global_num < run_max - 10:
             runs.append(current_run)
             current_run = []
@@ -431,7 +505,7 @@ def split_into_runs(
 
 
 def split_end_times_into_runs(
-        entries: List[Tuple[str, int]]
+    entries: List[Tuple[str, int]],
 ) -> List[Dict[int, Tuple[str, str]]]:
     """
     Split end time entries into runs and group by global_num within each run.
@@ -474,7 +548,7 @@ def split_end_times_into_runs(
 
 def ts_to_seconds(ts: str) -> int:
     """Convert HH:MM:SS timestamp to seconds since midnight."""
-    h, m, s = map(int, ts.split(':'))
+    h, m, s = map(int, ts.split(":"))
     return h * 3600 + m * 60 + s
 
 
@@ -489,7 +563,7 @@ def format_duration(start_ts: str, end_ts: str) -> str:
 
 
 def group_run_entries(
-        run: List[Tuple[str, Dict[str, str]]]
+    run: List[Tuple[str, Dict[str, str]]],
 ) -> List[Tuple[str, str, Dict[str, str]]]:
     """
     Group a single run's entries by global_num, tracking first/last start times.
@@ -502,7 +576,7 @@ def group_run_entries(
     seen: Dict[int, List] = {}
 
     for timestamp, action in run:
-        global_num = action['global_num']
+        global_num = action["global_num"]
 
         if global_num not in seen:
             seen[global_num] = [timestamp, timestamp, action]
@@ -521,9 +595,10 @@ def group_run_entries(
 
 
 def format_executed_actions(
-        executed: List[Tuple[str, Dict[str, str]]],
-        traffic_blocks: List[Dict] = None,
-        end_times_per_run: List[Dict[int, Tuple[str, str]]] = None) -> str:
+    executed: List[Tuple[str, Dict[str, str]]],
+    traffic_blocks: List[Dict] = None,
+    end_times_per_run: List[Dict[int, Tuple[str, str]]] = None,
+) -> str:
     """Format executed actions grouped by list and run."""
 
     if not executed:
@@ -532,32 +607,34 @@ def format_executed_actions(
     runs = split_into_runs(executed)
 
     output = []
-    output.append(f"\n{'='*80}")
+    output.append(f"\n{'=' * 80}")
     output.append(f"Executed Actions Timeline ({len(runs)} run(s))")
-    output.append(f"{'='*80}\n")
+    output.append(f"{'=' * 80}\n")
 
     # Pre-collect check start times (in run/action order) for range-based matching
     all_check_starts = []
     if traffic_blocks:
         for run in runs:
             for start_first, _, action in group_run_entries(run):
-                if action['action'] == 'check':
+                if action["action"] == "check":
                     all_check_starts.append(start_first)
 
     check_idx = 0
 
     for run_idx, run in enumerate(runs, 1):
-        run_end_times = (end_times_per_run[run_idx - 1]
-                         if end_times_per_run and run_idx - 1 < len(end_times_per_run)
-                         else {})
+        run_end_times = (
+            end_times_per_run[run_idx - 1]
+            if end_times_per_run and run_idx - 1 < len(end_times_per_run)
+            else {}
+        )
         grouped = group_run_entries(run)
         current_list = None
 
         for start_first, start_last, action in grouped:
-            list_num = action['list_num']
-            action_num = action['action_num']
-            total_lists = action['total_lists']
-            global_num = action['global_num']
+            list_num = action["list_num"]
+            action_num = action["action_num"]
+            total_lists = action["total_lists"]
+            global_num = action["global_num"]
 
             if current_list != list_num:
                 if current_list is not None:
@@ -566,27 +643,31 @@ def format_executed_actions(
                 output.append("-" * 60)
                 current_list = list_num
 
-            action_name = action['action']
-            target = action['target']
-            value = action['value']
+            action_name = action["action"]
+            target = action["target"]
+            value = action["value"]
 
-            if action_name == 'sleep':
+            if action_name == "sleep":
                 desc = f"sleep {value}s"
-            elif action_name == 'check':
+            elif action_name == "check":
                 desc = f"CHECK::{value} ✓"
             else:
                 target_str = f" [{target}]" if target else ""
                 value_str = f" = {value}" if value else ""
                 desc = f"{action_name}{target_str}{value_str}"
 
-            start_str = (f"{start_first}..{start_last}"
-                         if start_first != start_last else start_first)
+            start_str = (
+                f"{start_first}..{start_last}"
+                if start_first != start_last
+                else start_first
+            )
 
             end = run_end_times.get(global_num)
             if end:
                 end_first, end_last = end
-                end_str = (f"{end_first}..{end_last}"
-                           if end_first != end_last else end_first)
+                end_str = (
+                    f"{end_first}..{end_last}" if end_first != end_last else end_first
+                )
                 duration = format_duration(start_first, end_first)
                 time_str = f"{start_str} → {end_str} ({duration})"
             else:
@@ -595,10 +676,12 @@ def format_executed_actions(
                 f"  [{time_str}] #{global_num:3d} (Act {action_num:2d}): {desc}"
             )
 
-            if action_name == 'check' and traffic_blocks:
-                next_ts = (all_check_starts[check_idx + 1]
-                           if check_idx + 1 < len(all_check_starts)
-                           else None)
+            if action_name == "check" and traffic_blocks:
+                next_ts = (
+                    all_check_starts[check_idx + 1]
+                    if check_idx + 1 < len(all_check_starts)
+                    else None
+                )
                 blocks = find_traffic_blocks_for_check(
                     start_first, next_ts, traffic_blocks
                 )
@@ -610,16 +693,16 @@ def format_executed_actions(
         if run_idx < len(runs):
             output.append("")
 
-    return '\n'.join(output)
+    return "\n".join(output)
 
 
 def find_traffic_blocks_for_check(
-        check_ts: str,
-        next_check_ts: Optional[str],
-        traffic_blocks: List[Dict],
+    check_ts: str,
+    next_check_ts: Optional[str],
+    traffic_blocks: List[Dict],
 ) -> List[Dict]:
     """
-    Return traffic blocks whose anchor_ts falls in [check_ts, next_check_ts).
+    Return traffic blocks whose prior_ts falls in [check_ts, next_check_ts).
 
     Each check action owns the blocks that started after it began and before
     the next check started.  This is reliable because verifyHaStateAndTraffic
@@ -627,59 +710,157 @@ def find_traffic_blocks_for_check(
     """
     check_secs = ts_to_seconds(check_ts)
     next_secs = ts_to_seconds(next_check_ts) if next_check_ts else 86400
-    return [b for b in traffic_blocks
-            if b['anchor_ts'] != 'Unknown'
-            and check_secs <= ts_to_seconds(b['anchor_ts']) < next_secs]
+    return [
+        b
+        for b in traffic_blocks
+        if b["prior_ts"] != "Unknown"
+        and check_secs <= ts_to_seconds(b["prior_ts"]) < next_secs
+    ]
+
+
+def _format_ingress_flow_table(pf: Dict, af: Dict) -> List[str]:
+    """
+    Format a 4-column comparison table for one ingress-flow-stat snapshot pair.
+    Rows for identifier fields (flow-name, flow-id, publisher-id) are shown as
+    a sub-header; all remaining fields become data rows.
+    """
+    lines = []
+    flow_id = pf.get("flow-id", af.get("flow-id", "?"))
+    pub_id = pf.get("publisher-id", af.get("publisher-id", "?"))
+    lines.append(f"        ingress-flow-stat  flow-id={flow_id}  pub-id={pub_id}")
+
+    col = 40
+    lines.append(f"        {'Stat':<{col}} {'Prior':>10} {'After':>10} {'Delta':>10}")
+    lines.append(
+        f"        {'-' * col} {'----------':>10} {'----------':>10} {'----------':>10}"
+    )
+
+    keys = list(
+        dict.fromkeys(
+            [k for k in pf if k not in _INGRESS_FLOW_IDENTS]
+            + [k for k in af if k not in _INGRESS_FLOW_IDENTS]
+        )
+    )
+    for key in keys:
+        p = pf.get(key, "")
+        a = af.get(key, "")
+        delta = f"{a - p:+d}" if isinstance(p, int) and isinstance(a, int) else ""
+        lines.append(f"        {key:<{col}} {str(p):>10} {str(a):>10} {delta:>10}")
+    return lines
+
+
+def _format_egress_flow_table(pf: Dict, af: Dict) -> List[str]:
+    """
+    Format a 4-column comparison table for one egress-flow-stat snapshot pair.
+    Rows for identifier fields (flow-id, flow-state) are shown as a sub-header;
+    all remaining fields become data rows.
+    """
+    lines = []
+    flow_id = pf.get("flow-id", af.get("flow-id", "?"))
+    flow_state = pf.get("flow-state", af.get("flow-state", "?"))
+    lines.append(f"        egress-flow-stat  flow-id={flow_id}  state={flow_state}")
+
+    col = 40
+    lines.append(f"        {'Stat':<{col}} {'Prior':>10} {'After':>10} {'Delta':>10}")
+    lines.append(
+        f"        {'-' * col} {'----------':>10} {'----------':>10} {'----------':>10}"
+    )
+
+    keys = list(
+        dict.fromkeys(
+            [k for k in pf if k not in _EGRESS_FLOW_IDENTS]
+            + [k for k in af if k not in _EGRESS_FLOW_IDENTS]
+        )
+    )
+    for key in keys:
+        p = pf.get(key, "")
+        a = af.get(key, "")
+        delta = f"{a - p:+d}" if isinstance(p, int) and isinstance(a, int) else ""
+        lines.append(f"        {key:<{col}} {str(p):>10} {str(a):>10} {delta:>10}")
+    return lines
+
+
+def _format_side_stats_table(prior: Dict, after: Dict) -> List[str]:
+    """
+    Format a 4-column comparison table for client-side SDK stats.
+    Skips the 'rc' field (always "OK").
+    """
+    lines = []
+    col = 40
+    lines.append(f"        {'Stat':<{col}} {'Prior':>12} {'After':>12} {'Delta':>12}")
+    lines.append(
+        f"        {'-' * col} {'------------':>12} {'------------':>12} {'------------':>12}"
+    )
+    keys = list(dict.fromkeys(list(prior) + list(after)))
+    for key in keys:
+        if key == "rc":
+            continue
+        p = prior.get(key, "")
+        a = after.get(key, "")
+        if isinstance(p, int) and isinstance(a, int):
+            delta = f"{a - p:+d}"
+        elif isinstance(p, float) and isinstance(a, float):
+            delta = f"{a - p:+.2f}"
+        else:
+            delta = ""
+        lines.append(f"        {key:<{col}} {str(p):>12} {str(a):>12} {delta:>12}")
+    return lines
 
 
 def format_traffic_block(block: Dict) -> str:
-    """Format one traffic validation block (one verifyHaStateAndTraffic call)."""
+    """Format one prior/after stat dump pair as a 4-column comparison table."""
     lines = []
-    ts = block.get('anchor_ts', 'Unknown')
-    lines.append(f"    Traffic Validation ({ts}):")
+    prior_ts = block.get("prior_ts", "Unknown")
+    after_ts = block.get("after_ts", "Unknown")
+    lines.append(f"    Traffic dump:  prior={prior_ts}  after={after_ts}")
 
-    # Validation result
-    if 'validation' in block:
-        val = block['validation']
-        status = '✓' if val['passed'] else '✗'
-        lines.append(f"      Validation: expected≥{val['expected']}, "
-                     f"actual={val['actual']} {status}")
+    pub_clients = block.get("pub_clients", {})
+    sub_clients = block.get("sub_clients", {})
 
-    # Publisher SDK stats — txMsgs is a direct delta (stats reset before block)
-    if 'pub_stats_after' in block:
-        pub = block['pub_stats_after']
-        lines.append(f"      Pub SDK:    txMsgs={pub.get('txMsgs', 0)}, "
-                     f"txRate={pub.get('txMsgRate', 0.0)} msg/s")
+    if pub_clients:
+        lines.append("      Publisher client message-spool-stats:")
+        for client_name in sorted(pub_clients):
+            snapshots = pub_clients[client_name]
+            short = client_name.replace("c_vmrRedundancyRandomActions_pub_", "pub_")
+            lines.append(f"\n      Client: {short}")
+            prior_flows = snapshots.get("prior", {}).get("ingress_flows", [])
+            after_flows = snapshots.get("after", {}).get("ingress_flows", [])
+            for i in range(max(len(prior_flows), len(after_flows), 1)):
+                pf = prior_flows[i] if i < len(prior_flows) else {}
+                af = after_flows[i] if i < len(after_flows) else {}
+                lines.extend(_format_ingress_flow_table(pf, af))
+    else:
+        lines.append("      (no publisher client stats captured)")
 
-    # Subscriber SDK stats — rxMsgs is a direct delta (stats reset before block)
-    if 'sub_stats_after' in block:
-        sub = block['sub_stats_after']
-        lines.append(f"      Sub SDK:    rxMsgs={sub.get('rxMsgs', 0)}, "
-                     f"rxRate={sub.get('rxMsgRate', 0.0)} msg/s")
+    if sub_clients:
+        lines.append("\n      Subscriber client message-spool-stats:")
+        for client_name in sorted(sub_clients):
+            snapshots = sub_clients[client_name]
+            short = client_name.replace("c_vmrRedundancyRandomActions_sub_", "sub_")
+            lines.append(f"\n      Client: {short}")
+            prior_flows = snapshots.get("prior", {}).get("egress_flows", [])
+            after_flows = snapshots.get("after", {}).get("egress_flows", [])
+            for i in range(max(len(prior_flows), len(after_flows), 1)):
+                pf = prior_flows[i] if i < len(prior_flows) else {}
+                af = after_flows[i] if i < len(after_flows) else {}
+                lines.extend(_format_egress_flow_table(pf, af))
 
-    # Per-publisher broker stats — guaranteed-messages = msgs sent since clear
-    if block.get('pub_clients_after'):
-        clients = block['pub_clients_after']
-        total = sum(c.get('sent', 0) for c in clients.values())
-        lines.append(f"      Pub broker: {len(clients)} client(s), total_sent={total}")
-        for name, stats in sorted(clients.items()):
-            short = name.replace('c_vmrRedundancyRandomActions_pub_', 'pub_')
-            lines.append(f"        {short}: sent={stats.get('sent', 0)}, "
-                         f"last_id={stats.get('last_msg_id', 0)}")
+    pub_side = block.get("pub_side", {})
+    if pub_side.get("prior") and pub_side.get("after"):
+        lines.append("\n      Publisher client-side stats:")
+        lines.extend(_format_side_stats_table(pub_side["prior"], pub_side["after"]))
 
-    # Message-spool stats
-    if 'msg_spool' in block:
-        spool = block['msg_spool']
-        lines.append(f"      Spool:      ingress={spool.get('ingress', 0)}, "
-                     f"egress={spool.get('egress', 0)}, "
-                     f"discards={spool.get('discards', 0)}")
+    sub_side = block.get("sub_side", {})
+    if sub_side.get("prior") and sub_side.get("after"):
+        lines.append("\n      Subscriber client-side stats:")
+        lines.extend(_format_side_stats_table(sub_side["prior"], sub_side["after"]))
 
-    return '\n'.join(lines)
+    return "\n".join(lines)
 
 
 def main():
     # Parse command line arguments
-    log_file = '/tmp/debug/log.txt'
+    log_file = "/tmp/debug/log.txt"
     show_executed = False
     show_traffic = False
     filter_list = None
@@ -687,56 +868,72 @@ def main():
     i = 1
     while i < len(sys.argv):
         arg = sys.argv[i]
-        if arg in ('--help', '-h'):
+        if arg in ("--help", "-h"):
             print_help()
-        elif arg == '--executed':
+        elif arg == "--executed":
             show_executed = True
-        elif arg == '--traffic':
+        elif arg == "--traffic":
             show_traffic = True
-        elif arg == '--list' and i + 1 < len(sys.argv):
+        elif arg == "--list" and i + 1 < len(sys.argv):
             filter_list = int(sys.argv[i + 1])
             i += 1
-        elif not arg.startswith('--'):
+        elif not arg.startswith("--"):
             log_file = arg
         i += 1
 
     print(f"Parsing actions from: {log_file}")
-    mode_str = 'Executed actions' if show_executed else 'Declared action lists'
-    if filter_list is not None:
-        mode_str += f" (List {filter_list} only)"
-    if show_traffic:
-        mode_str += " with traffic stats"
+    if show_executed:
+        mode_str = "Executed actions"
+        if filter_list is not None:
+            mode_str += f" (List {filter_list} only)"
+        if show_traffic:
+            mode_str += " with traffic stats"
+    elif show_traffic:
+        mode_str = "Traffic dump pairs"
+    else:
+        mode_str = "Declared action lists"
+        if filter_list is not None:
+            mode_str += f" (List {filter_list} only)"
     print(f"Mode: {mode_str}\n")
 
     if show_executed:
-        # Extract and display executed actions
         executed = extract_executed_actions(log_file)
 
         if not executed:
             print("No executed actions found in log file.")
             return 1
 
-        # Filter by list if requested
         if filter_list is not None:
-            executed = [(ts, act) for ts, act in executed if act['list_num'] == filter_list]
+            executed = [
+                (ts, act) for ts, act in executed if act["list_num"] == filter_list
+            ]
 
         print(f"Found {len(executed)} executed action(s)\n")
 
-        # Extract traffic blocks if requested
         traffic_blocks = None
         if show_traffic:
-            print("Extracting traffic validation blocks...\n")
             traffic_blocks = extract_traffic_blocks(log_file)
             if traffic_blocks:
-                print(f"Found {len(traffic_blocks)} traffic validation block(s)\n")
+                print(f"Found {len(traffic_blocks)} traffic dump pair(s)\n")
 
         end_times_per_run = split_end_times_into_runs(
             extract_end_time_entries(log_file)
         )
         print(format_executed_actions(executed, traffic_blocks, end_times_per_run))
 
+    elif show_traffic:
+        traffic_blocks = extract_traffic_blocks(log_file)
+        if not traffic_blocks:
+            print("No traffic dump pairs found in log file.")
+            return 1
+        print(f"Found {len(traffic_blocks)} traffic dump pair(s)\n")
+        for idx, block in enumerate(traffic_blocks, 1):
+            print(f"\n{'=' * 70}")
+            print(f"Dump pair {idx}/{len(traffic_blocks)}")
+            print("=" * 70)
+            print(format_traffic_block(block))
+
     else:
-        # Extract and display declared action lists
         action_lists = extract_action_lists(log_file)
 
         if not action_lists:
@@ -745,7 +942,6 @@ def main():
 
         print(f"Found {len(action_lists)} action list(s)\n")
 
-        # Process and display each action list
         for timestamp, full_line, action_text in action_lists:
             actions = parse_actions(action_text)
             print(format_action_list_compact(timestamp, actions))
@@ -753,5 +949,5 @@ def main():
     return 0
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     sys.exit(main())
