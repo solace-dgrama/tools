@@ -238,9 +238,121 @@ def _parse_client_spool_stats(xml_lines: List[str]) -> Optional[Dict]:
     return result
 
 
+def _flatten_element(elem: ET.Element, prefix: str = "") -> Dict[str, Any]:
+    """
+    Recursively flatten an XML element's children into a dotted-key dict.
+
+    Leaf elements (no children) are stored as {tag: value}; elements with
+    children are expanded as {parent.child: value, ...}.
+    """
+    result = {}
+    for child in elem:
+        key = f"{prefix}{child.tag}"
+        if len(child):
+            result.update(_flatten_element(child, f"{key}."))
+        else:
+            text = (child.text or "").strip()
+            try:
+                result[key] = int(text)
+            except ValueError:
+                result[key] = text
+    return result
+
+
+def _parse_spool_stats_flat(xml_lines: List[str]) -> Optional[Dict[str, Any]]:
+    """
+    Parse global message-spool-stats from an RPC-REPLY XML captured as lines.
+
+    Returns a flat {key: value} dict; nested elements are expanded with dotted
+    keys (e.g. xa-transactions-success-operations.recover).
+    Returns None if the XML cannot be parsed or the expected element is missing.
+    """
+    try:
+        root = ET.fromstring("\n".join(xml_lines))
+    except ET.ParseError:
+        return None
+    spool = root.find("./rpc/show/message-spool/message-spool-stats")
+    if spool is None:
+        return None
+    return _flatten_element(spool)
+
+
+def _parse_queue_info(xml_lines: List[str]) -> Optional[Dict[str, Any]]:
+    """
+    Parse queue info from an RPC-REPLY XML captured as lines.
+
+    Extracts direct children of the <info> element only; nested elements
+    (event, clients) are skipped.
+    Returns None if the XML cannot be parsed or the expected element is missing.
+    """
+    try:
+        root = ET.fromstring("\n".join(xml_lines))
+    except ET.ParseError:
+        return None
+    info = root.find("./rpc/show/queue/queues/queue/info")
+    if info is None:
+        return None
+    return _parse_element_flat(info)
+
+
 # Fields used as sub-header identifiers in flow-stat tables, not data rows.
 _INGRESS_FLOW_IDENTS = frozenset({"flow-name", "flow-id", "publisher-id"})
 _EGRESS_FLOW_IDENTS = frozenset({"flow-id"})
+
+
+def _handle_result_line(
+    line: str,
+    block: Dict,
+    phase: Optional[str],
+    section: Optional[str],
+) -> Optional[str]:
+    """
+    Process a [RESULT] log line and return the resulting section value.
+
+    Side effect: updates block pub_side or sub_side for SDK-stats lines.
+    Returns the new section; returns the existing section if the line is
+    not a recognised stats-section anchor.
+    """
+    if "Publisher client message-spool-stats:" in line:
+        return "pub"
+    if "Subscriber client message-spool-stats:" in line:
+        return "sub"
+    if "Global message-spool stats:" in line:
+        return "global"
+    if "Publisher client-side stats:" in line and phase:
+        block["pub_side"][phase] = _parse_tcl_kv(line)
+        return None
+    if "Subscriber client-side stats:" in line and phase:
+        block["sub_side"][phase] = _parse_tcl_kv(line)
+        return None
+    if re.search(r"\bVPN \S+ message-spool stats:", line):
+        return "vpn_spool"
+    if re.search(r"\bQueue \S+ stats:", line):
+        return "queue"
+    return section
+
+
+def _store_xml_result(
+    block: Dict, xml_lines: List[str], section: str, client: str, phase: str
+) -> None:
+    """Store parsed XML result into the appropriate section of a traffic block."""
+    if section in ("pub", "sub"):
+        stats = _parse_client_spool_stats(xml_lines)
+        if stats is not None:
+            store = block["pub_clients"] if section == "pub" else block["sub_clients"]
+            store.setdefault(client, {})[phase] = stats
+    elif section == "global":
+        stats = _parse_spool_stats_flat(xml_lines)
+        if stats is not None:
+            block["global_spools"].setdefault(client, {})[phase] = stats
+    elif section == "vpn_spool":
+        stats = _parse_spool_stats_flat(xml_lines)
+        if stats is not None:
+            block["vpn_spools"].setdefault(client, {})[phase] = stats
+    elif section == "queue":
+        stats = _parse_queue_info(xml_lines)
+        if stats is not None:
+            block["queues"].setdefault(client, {})[phase] = stats
 
 
 def extract_traffic_blocks(log_file: str) -> List[Dict]:
@@ -258,9 +370,10 @@ def extract_traffic_blocks(log_file: str) -> List[Dict]:
     blocks: List[Dict] = []
     block: Optional[Dict] = None
     phase: Optional[str] = None  # 'prior' or 'after'
-    section: Optional[str] = None  # 'pub' or 'sub'
+    section: Optional[str] = None  # 'pub', 'sub', 'global', 'vpn_spool', 'queue'
     awaiting_name = False
     current_client: Optional[str] = None
+    pending_router: Optional[str] = None
     in_xml = False
     xml_lines: List[str] = []
 
@@ -277,6 +390,9 @@ def extract_traffic_blocks(log_file: str) -> List[Dict]:
                         "after_ts": None,
                         "pub_clients": {},
                         "sub_clients": {},
+                        "global_spools": {},
+                        "vpn_spools": {},
+                        "queues": {},
                         "pub_side": {},
                         "sub_side": {},
                     }
@@ -284,6 +400,7 @@ def extract_traffic_blocks(log_file: str) -> List[Dict]:
                     section = None
                     awaiting_name = False
                     current_client = None
+                    pending_router = None
                     in_xml = False
                     xml_lines = []
                     continue
@@ -296,6 +413,7 @@ def extract_traffic_blocks(log_file: str) -> List[Dict]:
                     section = None
                     awaiting_name = False
                     current_client = None
+                    pending_router = None
                     in_xml = False
                     xml_lines = []
                     block["after_ts"] = _extract_ts(line)
@@ -305,45 +423,23 @@ def extract_traffic_blocks(log_file: str) -> List[Dict]:
                     xml_lines.append(line)
                     if "</rpc-reply>" in line:
                         in_xml = False
-                        if current_client and section in ("pub", "sub") and phase:
-                            stats = _parse_client_spool_stats(xml_lines)
-                            if stats is not None:
-                                store = (
-                                    block["pub_clients"]
-                                    if section == "pub"
-                                    else block["sub_clients"]
-                                )
-                                store.setdefault(current_client, {})
-                                store[current_client][phase] = stats
+                        if (
+                            current_client
+                            and section
+                            in ("pub", "sub", "global", "vpn_spool", "queue")
+                            and phase
+                        ):
+                            _store_xml_result(
+                                block, xml_lines, section, current_client, phase
+                            )
                         xml_lines = []
                         current_client = None
                     continue
 
                 if "[RESULT]" in line:
-                    if "Publisher client message-spool-stats:" in line:
-                        section = "pub"
-                        awaiting_name = False
-                    elif "Subscriber client message-spool-stats:" in line:
-                        section = "sub"
-                        awaiting_name = False
-                    elif "Publisher client-side stats:" in line and phase:
-                        block["pub_side"][phase] = _parse_tcl_kv(line)
-                        section = None
-                        awaiting_name = False
-                    elif "Subscriber client-side stats:" in line and phase:
-                        block["sub_side"][phase] = _parse_tcl_kv(line)
-                        section = None
-                        awaiting_name = False
-                    elif any(
-                        s in line
-                        for s in (
-                            "Global message-spool stats:",
-                            "VPN default message-spool stats:",
-                            "Queue ",
-                        )
-                    ):
-                        section = None
-                        awaiting_name = False
+                    section = _handle_result_line(line, block, phase, section)
+                    awaiting_name = False
+                    pending_router = None
                     continue
 
                 if section in ("pub", "sub"):
@@ -354,6 +450,72 @@ def extract_traffic_blocks(log_file: str) -> List[Dict]:
                         m = re.search(r"P2: -name (\S+)", line)
                         if m:
                             current_client = m.group(1)
+                        awaiting_name = False
+                        continue
+                    if current_client and "RPC-REPLY:" in line:
+                        in_xml = True
+                        xml_lines = []
+                        remainder = line[line.index("RPC-REPLY:") + 10 :].strip()
+                        if remainder:
+                            xml_lines.append(remainder)
+                elif section == "global":
+                    if "::L1::Show::MessageSpool] Method params:" in line:
+                        awaiting_name = True
+                        continue
+                    if awaiting_name and "P1: -rtrObj" in line:
+                        m = re.search(
+                            r"P1: -rtrObj (?:::RtrManager::)?router_(\S+)", line
+                        )
+                        if m:
+                            current_client = m.group(1)
+                        awaiting_name = False
+                        continue
+                    if current_client and "RPC-REPLY:" in line:
+                        in_xml = True
+                        xml_lines = []
+                        remainder = line[line.index("RPC-REPLY:") + 10 :].strip()
+                        if remainder:
+                            xml_lines.append(remainder)
+                elif section == "vpn_spool":
+                    if "::L1::Show::MessageSpool] Method params:" in line:
+                        awaiting_name = True
+                        pending_router = None
+                        continue
+                    if awaiting_name and "P1: -rtrObj" in line:
+                        m = re.search(
+                            r"P1: -rtrObj (?:::RtrManager::)?router_(\S+)", line
+                        )
+                        if m:
+                            pending_router = m.group(1)
+                        continue
+                    if awaiting_name and pending_router and "P3: -msgVpn" in line:
+                        m = re.search(r"P3: -msgVpn (\S+)", line)
+                        if m:
+                            current_client = f"{pending_router}:{m.group(1)}"
+                        awaiting_name = False
+                        continue
+                    if current_client and "RPC-REPLY:" in line:
+                        in_xml = True
+                        xml_lines = []
+                        remainder = line[line.index("RPC-REPLY:") + 10 :].strip()
+                        if remainder:
+                            xml_lines.append(remainder)
+                elif section == "queue":
+                    if "::L1::Show::Queue] Method params:" in line:
+                        awaiting_name = True
+                        pending_router = None
+                        continue
+                    if awaiting_name and "P1: -rtrObj" in line:
+                        m = re.search(
+                            r"P1: -rtrObj (?:::RtrManager::)?router_(\S+)", line
+                        )
+                        if m:
+                            pending_router = m.group(1)
+                        continue
+                    if awaiting_name and pending_router and "P2: -name" in line:
+                        m = re.search(r"P2: -name (\S+)", line)
+                        if m:
+                            current_client = f"{pending_router}:{m.group(1)}"
                         awaiting_name = False
                         continue
                     if current_client and "RPC-REPLY:" in line:
@@ -783,12 +945,13 @@ def _format_egress_flow_table(pf: Dict, af: Dict) -> List[str]:
 def _format_flat_stats_table(label: str, prior: Dict, after: Dict) -> List[str]:
     """Format a 4-column comparison table for a flat broker stat section."""
     lines = [f"        {label}"]
-    col = 40
+    keys = list(dict.fromkeys(list(prior) + list(after)))
+    col = max(40, max((len(k) for k in keys), default=0) + 2)
     lines.append(f"        {'Stat':<{col}} {'Prior':>10} {'After':>10} {'Delta':>10}")
     lines.append(
         f"        {'-' * col} {'----------':>10} {'----------':>10} {'----------':>10}"
     )
-    for key in dict.fromkeys(list(prior) + list(after)):
+    for key in keys:
         p = prior.get(key, "")
         a = after.get(key, "")
         delta = f"{a - p:+d}" if isinstance(p, int) and isinstance(a, int) else ""
@@ -882,6 +1045,41 @@ def format_traffic_block(block: Dict) -> str:
             short = name.replace("c_vmrRedundancyRandomActions_sub_", "sub_")
             lines.append(f"\n      Client: {short}")
             lines.extend(_format_client_spool_section(sub_clients[name]))
+
+    global_spools = block.get("global_spools", {})
+    if global_spools:
+        lines.append("\n      Global message-spool stats:")
+        for router in sorted(global_spools):
+            lines.append(f"\n      Router: {router}")
+            snaps = global_spools[router]
+            p = snaps.get("prior", {})
+            a = snaps.get("after", {})
+            if p or a:
+                lines.extend(_format_flat_stats_table("message-spool-stats", p, a))
+
+    vpn_spools = block.get("vpn_spools", {})
+    if vpn_spools:
+        lines.append("\n      VPN message-spool stats:")
+        for key in sorted(vpn_spools):
+            router, vpn = key.split(":", 1)
+            lines.append(f"\n      Router: {router}  VPN: {vpn}")
+            snaps = vpn_spools[key]
+            p = snaps.get("prior", {})
+            a = snaps.get("after", {})
+            if p or a:
+                lines.extend(_format_flat_stats_table("message-spool-stats", p, a))
+
+    queues = block.get("queues", {})
+    if queues:
+        lines.append("\n      Queue stats:")
+        for key in sorted(queues):
+            router, qname = key.split(":", 1)
+            lines.append(f"\n      Router: {router}  Queue: {qname}")
+            snaps = queues[key]
+            p = snaps.get("prior", {})
+            a = snaps.get("after", {})
+            if p or a:
+                lines.extend(_format_flat_stats_table("queue-info", p, a))
 
     pub_side = block.get("pub_side", {})
     if pub_side.get("prior") and pub_side.get("after"):
