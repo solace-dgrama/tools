@@ -780,6 +780,56 @@ def _format_egress_flow_table(pf: Dict, af: Dict) -> List[str]:
     return lines
 
 
+def _format_flat_stats_table(label: str, prior: Dict, after: Dict) -> List[str]:
+    """Format a 4-column comparison table for a flat broker stat section."""
+    lines = [f"        {label}"]
+    col = 40
+    lines.append(f"        {'Stat':<{col}} {'Prior':>10} {'After':>10} {'Delta':>10}")
+    lines.append(
+        f"        {'-' * col} {'----------':>10} {'----------':>10} {'----------':>10}"
+    )
+    for key in dict.fromkeys(list(prior) + list(after)):
+        p = prior.get(key, "")
+        a = after.get(key, "")
+        delta = f"{a - p:+d}" if isinstance(p, int) and isinstance(a, int) else ""
+        lines.append(f"        {key:<{col}} {str(p):>10} {str(a):>10} {delta:>10}")
+    return lines
+
+
+def _format_client_spool_section(snapshots: Dict) -> List[str]:
+    """
+    Format all four message-spool-stats sub-sections for one client snapshot pair.
+
+    Sections are rendered in order: ingress flows, egress flows,
+    qendpt-bind-stats, publisher-open-stats.
+    """
+    lines = []
+    prior = snapshots.get("prior", {})
+    after = snapshots.get("after", {})
+
+    for flows, fmt in (
+        ("ingress_flows", _format_ingress_flow_table),
+        ("egress_flows", _format_egress_flow_table),
+    ):
+        pf_list = prior.get(flows, [])
+        af_list = after.get(flows, [])
+        for i in range(max(len(pf_list), len(af_list))):
+            pf = pf_list[i] if i < len(pf_list) else {}
+            af = af_list[i] if i < len(af_list) else {}
+            lines.extend(fmt(pf, af))
+
+    for label, key in (
+        ("qendpt-bind-stats", "qendpt_bind"),
+        ("publisher-open-stats", "pub_open"),
+    ):
+        p = prior.get(key) or {}
+        a = after.get(key) or {}
+        if p or a:
+            lines.extend(_format_flat_stats_table(label, p, a))
+
+    return lines
+
+
 def _format_side_stats_table(prior: Dict, after: Dict) -> List[str]:
     """
     Format a 4-column comparison table for client-side SDK stats.
@@ -819,31 +869,19 @@ def format_traffic_block(block: Dict) -> str:
 
     if pub_clients:
         lines.append("      Publisher client message-spool-stats:")
-        for client_name in sorted(pub_clients):
-            snapshots = pub_clients[client_name]
-            short = client_name.replace("c_vmrRedundancyRandomActions_pub_", "pub_")
+        for name in sorted(pub_clients):
+            short = name.replace("c_vmrRedundancyRandomActions_pub_", "pub_")
             lines.append(f"\n      Client: {short}")
-            prior_flows = snapshots.get("prior", {}).get("ingress_flows", [])
-            after_flows = snapshots.get("after", {}).get("ingress_flows", [])
-            for i in range(max(len(prior_flows), len(after_flows), 1)):
-                pf = prior_flows[i] if i < len(prior_flows) else {}
-                af = after_flows[i] if i < len(after_flows) else {}
-                lines.extend(_format_ingress_flow_table(pf, af))
+            lines.extend(_format_client_spool_section(pub_clients[name]))
     else:
         lines.append("      (no publisher client stats captured)")
 
     if sub_clients:
         lines.append("\n      Subscriber client message-spool-stats:")
-        for client_name in sorted(sub_clients):
-            snapshots = sub_clients[client_name]
-            short = client_name.replace("c_vmrRedundancyRandomActions_sub_", "sub_")
+        for name in sorted(sub_clients):
+            short = name.replace("c_vmrRedundancyRandomActions_sub_", "sub_")
             lines.append(f"\n      Client: {short}")
-            prior_flows = snapshots.get("prior", {}).get("egress_flows", [])
-            after_flows = snapshots.get("after", {}).get("egress_flows", [])
-            for i in range(max(len(prior_flows), len(after_flows), 1)):
-                pf = prior_flows[i] if i < len(prior_flows) else {}
-                af = after_flows[i] if i < len(after_flows) else {}
-                lines.extend(_format_egress_flow_table(pf, af))
+            lines.extend(_format_client_spool_section(sub_clients[name]))
 
     pub_side = block.get("pub_side", {})
     if pub_side.get("prior") and pub_side.get("after"):
