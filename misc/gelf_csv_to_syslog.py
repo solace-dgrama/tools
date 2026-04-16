@@ -13,6 +13,7 @@ Output format:
     <timestamp> <facility.level> <host> appuser: <short_message>
 """
 
+import argparse
 import csv
 import json
 import re
@@ -88,10 +89,23 @@ def convert(csv_file):
 
 
 if __name__ == "__main__":
-    if len(sys.argv) != 2:
-        print(f"Usage: {sys.argv[0]} <csv_file>", file=sys.stderr)
-        sys.exit(1)
+    parser = argparse.ArgumentParser(
+        description=(
+            "Convert a GELF CSV log file to syslog debug-log format on stdout."
+        ),
+        epilog=(
+            "The CSV must have columns: timestamp, source, message.\n"
+            "Each 'message' field may be a GELF JSON object (or multiple\n"
+            "concatenated objects) or an already-formatted syslog line.\n\n"
+            "Output format:\n"
+            "  <timestamp> <facility.level> <host> appuser: <short_message>\n\n"
+            "Timestamps are converted from UTC to local time."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument("csv_file", help="path to the GELF CSV input file")
+    args = parser.parse_args()
     try:
-        convert(sys.argv[1])
+        convert(args.csv_file)
     except BrokenPipeError:
         sys.exit(0)
