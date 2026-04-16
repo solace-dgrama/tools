@@ -24,6 +24,12 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("older_load", help="e.g. 100.0main.0.6011")
     parser.add_argument("newer_load", help="e.g. 100.0main.0.6337")
+    parser.add_argument(
+        "--repo",
+        type=Path,
+        default=Path.cwd(),
+        help="path to the broker git repo (default: current directory)",
+    )
     args = parser.parse_args()
 
     older_sha = get_sha(args.older_load)
@@ -44,6 +50,7 @@ def main() -> None:
         capture_output=True,
         text=True,
         check=True,
+        cwd=args.repo,
     )
     print(result.stdout)
 
