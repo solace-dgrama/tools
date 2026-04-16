@@ -44,7 +44,7 @@ def main() -> None:
             "git",
             "log",
             f"{older_sha}..{newer_sha}",
-            "--format=commit %H\nAuthor: %an\n%s\n" + "-" * 72,
+            "--format=" + "-" * 72 + "\ncommit %H\nAuthor: %an\n%s",
             "--name-only",
         ],
         capture_output=True,
