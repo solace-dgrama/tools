@@ -7,11 +7,14 @@ import subprocess
 import sys
 from pathlib import Path
 
-LOADS_DIR = Path("/home/public/RND/loads/solcbr/main")
+from solcbr_loads import load_path
 
 
 def get_sha(load: str) -> str:
-    log = LOADS_DIR / load / "logs" / "build.log"
+    path = load_path(load)
+    if path is None:
+        sys.exit(f"Error: cannot determine path for load {load!r}")
+    log = path / "logs" / "build.log"
     if not log.exists():
         sys.exit(f"Error: build log not found: {log}")
     match = re.search(r"GIT_COMMIT=([0-9a-f]+)", log.read_text())

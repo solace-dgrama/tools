@@ -28,6 +28,10 @@ import sys
 import urllib.request
 from pathlib import Path
 
+from solcbr_loads import LOADS_BASE as _LOADS_BASE
+from solcbr_loads import load_path as _load_path
+from solcbr_loads import strip_soltr as _strip_soltr
+
 
 # ---------------------------------------------------------------------------
 # Perf-host name/IP helpers  (perf-A-B  ↔  192.168.A.B)
@@ -58,42 +62,6 @@ def display_perf(ip: str) -> str:
     hostname = ip_to_perf_host(ip)
     return f'{ip} ({hostname})' if hostname != ip else ip
 
-
-# ---------------------------------------------------------------------------
-# Load availability helpers
-# ---------------------------------------------------------------------------
-
-_LOADS_BASE = Path('/home/public/RND/loads/solcbr')
-
-
-def _strip_soltr(version: str) -> str:
-    """Strip 'soltr_' prefix from a load version string."""
-    return version.removeprefix('soltr_')
-
-
-def _load_path(version: str) -> Path | None:
-    """Return the expected filesystem path for a load, or None if unparseable.
-
-    Three layouts are supported:
-        regular: _LOADS_BASE/<X.Y.Z>/<X.Y.Z.BUILD>/   e.g. 10.25.0.202
-        feature: _LOADS_BASE/feature/<NAME>/<VERSION>/ e.g. 100.0SOL-144552.0.5612
-        main:    _LOADS_BASE/main/<VERSION>/           e.g. 100.0main.0.5554
-
-    The type is determined by the second dotted segment: purely numeric → regular;
-    'main' → main; anything else → feature (name = second segment minus leading digits).
-    """
-    v = _strip_soltr(version)
-    parts = v.split('.')
-    if len(parts) < 2:
-        return None
-    branch = re.sub(r'^\d+', '', parts[1])   # '' for regular, 'main', 'SOL-144552', …
-    if branch == 'main':
-        return _LOADS_BASE / 'main' / v
-    if branch:
-        return _LOADS_BASE / 'feature' / branch / v
-    # Regular release
-    dot = v.rfind('.')
-    return _LOADS_BASE / v[:dot] / v
 
 
 def _version_display(version: str) -> str:
@@ -822,7 +790,7 @@ def book_resources(
             perf_ips.append(normalize_to_ip(name))
             booked_items.append(('perf-host', name))
         else:
-            print(f'    No perf-host available.')
+            print('    No perf-host available.')
             raw = input(
                 f'    Enter perf-host {i + 1}/{n_perfhosts} hostname or IP (or leave empty to skip): '
             ).strip()
