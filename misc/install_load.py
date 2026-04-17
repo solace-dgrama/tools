@@ -64,6 +64,10 @@ def scp(src: Path, appliance: str, dest_dir: str) -> None:
     dest = f"root@{appliance}:{dest_dir}"
     print(f"Copying {src.name} -> {dest} ...")
     subprocess.run(["scp", str(src), dest], check=True)
+    remote_path = f"{dest_dir.rstrip('/')}/{src.name}"
+    subprocess.run(
+        ["ssh", f"root@{appliance}", "chgrp", "solgroup", remote_path], check=True
+    )
 
 
 def main() -> None:
