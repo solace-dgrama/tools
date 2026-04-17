@@ -99,8 +99,8 @@ def main() -> None:
     for appliance in appliances:
         print(f"\n--- {appliance} ---")
         setup_keyless_access(appliance)
-        scp(solbase_tarball, appliance, "/usr/sw/loads/")
-        scp(broker_tarball, appliance, "/usr/sw/loads/")
+        scp(solbase_tarball, appliance, "/usr/sw/jail/loads/")
+        scp(broker_tarball, appliance, "/usr/sw/jail/loads/")
 
     print("\nDone.")
 
