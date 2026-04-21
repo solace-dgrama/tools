@@ -169,7 +169,7 @@ def _extract_ts(line: str) -> str:
 def _parse_tcl_kv(line: str) -> Dict:
     """Parse Tcl-style {key value} pairs from a line into a typed dict."""
     result = {}
-    for key, val in re.findall(r"\{(\w+)\s+([^}]+)\}", line):
+    for key, val in re.findall(r"\{(\w+)\s+(\{[^}]*\}|[^{}]+)\}", line):
         val = val.strip()
         try:
             result[key] = int(val)
@@ -298,6 +298,7 @@ def _parse_queue_info(xml_lines: List[str]) -> Optional[Dict[str, Any]]:
 # Fields used as sub-header identifiers in flow-stat tables, not data rows.
 _INGRESS_FLOW_IDENTS = frozenset({"flow-name", "flow-id", "publisher-id"})
 _EGRESS_FLOW_IDENTS = frozenset({"flow-id"})
+_CUSTOM_STATS_SKIP = frozenset({"latencyBuckets"})
 
 
 def _handle_result_line(
@@ -319,6 +320,18 @@ def _handle_result_line(
         return "sub"
     if "Global message-spool stats:" in line:
         return "global"
+    if "Publisher client-side custom stats:" in line and phase:
+        block["pub_custom"][phase] = _parse_tcl_kv(line)
+        return None
+    if "Subscriber client-side custom stats:" in line and phase:
+        block["sub_custom"][phase] = _parse_tcl_kv(line)
+        return None
+    if "Publisher client-side CSMP stats:" in line and phase:
+        block["pub_csmp"][phase] = _parse_tcl_kv(line)
+        return None
+    if "Subscriber client-side CSMP stats:" in line and phase:
+        block["sub_csmp"][phase] = _parse_tcl_kv(line)
+        return None
     if "Publisher client-side stats:" in line and phase:
         block["pub_side"][phase] = _parse_tcl_kv(line)
         return None
@@ -395,6 +408,10 @@ def extract_traffic_blocks(log_file: str) -> List[Dict]:
                         "queues": {},
                         "pub_side": {},
                         "sub_side": {},
+                        "pub_custom": {},
+                        "sub_custom": {},
+                        "pub_csmp": {},
+                        "sub_csmp": {},
                     }
                     phase = "prior"
                     section = None
@@ -993,21 +1010,21 @@ def _format_client_spool_section(snapshots: Dict) -> List[str]:
     return lines
 
 
-def _format_side_stats_table(prior: Dict, after: Dict) -> List[str]:
+def _format_side_stats_table(
+    prior: Dict, after: Dict, skip: frozenset = frozenset()
+) -> List[str]:
     """
     Format a 4-column comparison table for client-side SDK stats.
-    Skips the 'rc' field (always "OK").
+    Skips the 'rc' field (always "OK") and any keys in skip.
     """
     lines = []
-    col = 40
+    keys = [k for k in dict.fromkeys(list(prior) + list(after)) if k != "rc" and k not in skip]
+    col = max(max((len(k) for k in keys), default=0), 40)
     lines.append(f"        {'Stat':<{col}} {'Prior':>12} {'After':>12} {'Delta':>12}")
     lines.append(
         f"        {'-' * col} {'------------':>12} {'------------':>12} {'------------':>12}"
     )
-    keys = list(dict.fromkeys(list(prior) + list(after)))
     for key in keys:
-        if key == "rc":
-            continue
         p = prior.get(key, "")
         a = after.get(key, "")
         if isinstance(p, int) and isinstance(a, int):
@@ -1090,6 +1107,34 @@ def format_traffic_block(block: Dict) -> str:
     if sub_side.get("prior") and sub_side.get("after"):
         lines.append("\n      Subscriber client-side stats:")
         lines.extend(_format_side_stats_table(sub_side["prior"], sub_side["after"]))
+
+    pub_custom = block.get("pub_custom", {})
+    if pub_custom.get("prior") and pub_custom.get("after"):
+        lines.append("\n      Publisher client-side custom stats:")
+        lines.extend(
+            _format_side_stats_table(
+                pub_custom["prior"], pub_custom["after"], skip=_CUSTOM_STATS_SKIP
+            )
+        )
+
+    sub_custom = block.get("sub_custom", {})
+    if sub_custom.get("prior") and sub_custom.get("after"):
+        lines.append("\n      Subscriber client-side custom stats:")
+        lines.extend(
+            _format_side_stats_table(
+                sub_custom["prior"], sub_custom["after"], skip=_CUSTOM_STATS_SKIP
+            )
+        )
+
+    pub_csmp = block.get("pub_csmp", {})
+    if pub_csmp.get("prior") and pub_csmp.get("after"):
+        lines.append("\n      Publisher client-side CSMP stats:")
+        lines.extend(_format_side_stats_table(pub_csmp["prior"], pub_csmp["after"]))
+
+    sub_csmp = block.get("sub_csmp", {})
+    if sub_csmp.get("prior") and sub_csmp.get("after"):
+        lines.append("\n      Subscriber client-side CSMP stats:")
+        lines.extend(_format_side_stats_table(sub_csmp["prior"], sub_csmp["after"]))
 
     return "\n".join(lines)
 
